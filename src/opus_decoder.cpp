@@ -3,7 +3,9 @@
 #include <opus.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <memory>
 #include <new>
 #include <vector>
@@ -64,17 +66,59 @@ bool readBlock(const std::vector<uint8_t>& b,size_t begin,size_t end,uint64_t wa
     }
     return p<=end;
 }
+constexpr uint64_t kMaxDownloadBytes=80ull*1024*1024;
+constexpr uint64_t kChunkBytes=2ull*1024*1024;
+uint64_t contentLengthFromUrl(const std::string& url){
+    for(size_t p=url.find("clen=");p!=std::string::npos;p=url.find("clen=",p+1))if(p>0&&(url[p-1]=='?'||url[p-1]=='&'))return std::strtoull(url.c_str()+p+5,nullptr,10);
+    return 0;
+}
+// Descarga un bloque (ya con &range=a-b en la ruta) y lo añade a data. Falla si el bloque llega incompleto.
+bool fetchChunk(HINTERNET conn,const std::wstring& path,DWORD flags,std::vector<uint8_t>& data,DWORD& status,std::string& error){
+    const size_t start=data.size();status=0;bool ok=false;
+    HINTERNET req=WinHttpOpenRequest(conn,L"GET",path.c_str(),nullptr,L"https://www.youtube.com/",WINHTTP_DEFAULT_ACCEPT_TYPES,flags);
+    if(!req){error="Opening audio request failed: "+std::to_string(GetLastError());return false;}
+    if(WinHttpSendRequest(req,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(req,nullptr)){
+        DWORD size=sizeof(status);
+        if(WinHttpQueryHeaders(req,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX)&&(status==200||status==206)){
+            DWORD expected=0;size=sizeof(expected);
+            const bool hasLength=WinHttpQueryHeaders(req,WINHTTP_QUERY_CONTENT_LENGTH|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&expected,&size,WINHTTP_NO_HEADER_INDEX)!=FALSE;
+            ok=true;DWORD available=0;
+            for(;;){
+                if(!WinHttpQueryDataAvailable(req,&available)){error="Querying WebM audio data failed: "+std::to_string(GetLastError());ok=false;break;}
+                if(!available)break;
+                if(data.size()+available>kMaxDownloadBytes){error="WebM audio exceeds the 80 MiB safety limit.";ok=false;break;}
+                const size_t old=data.size();data.resize(old+available);DWORD got=0;
+                if(!WinHttpReadData(req,&data[old],available,&got)){data.resize(old);error="Reading WebM audio failed: "+std::to_string(GetLastError());ok=false;break;}
+                data.resize(old+got);if(!got)break;
+            }
+            if(ok&&hasLength&&data.size()-start!=expected){error="Audio chunk truncated: received "+std::to_string(data.size()-start)+" of "+std::to_string(expected)+" bytes.";ok=false;}
+        }else error=status?"Audio download HTTP status "+std::to_string(status):"Reading audio response headers failed: "+std::to_string(GetLastError());
+    }else error="WebM audio request failed: "+std::to_string(GetLastError());
+    WinHttpCloseHandle(req);if(!ok)data.resize(start);return ok;
+}
+// Descarga por bloques con el parámetro range de googlevideo (como yt-dlp): evita el límite de velocidad de las
+// descargas de archivo completo y permite detectar cortes. Cada bloque se reintenta una vez.
 bool download(const std::string& url,std::vector<uint8_t>& data,std::string& error){
     std::wstring wide(url.begin(),url.end());URL_COMPONENTS c{};c.dwStructSize=sizeof(c);wchar_t host[512]{},path[16384]{},extra[16384]{};c.lpszHostName=host;c.dwHostNameLength=512;c.lpszUrlPath=path;c.dwUrlPathLength=16384;c.lpszExtraInfo=extra;c.dwExtraInfoLength=16384;
     if(!WinHttpCrackUrl(wide.c_str(),(DWORD)wide.size(),0,&c)){error="Could not parse the signed audio URL.";return false;}
     const INTERNET_PORT port=c.nPort;const DWORD flags=c.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0;std::wstring requestPath(path,c.dwUrlPathLength);requestPath.append(extra,c.dwExtraInfoLength);
     HINTERNET session=WinHttpOpen(L"Ytm32 Opus/1.6.1",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);if(!session){error="Opus download session failed: "+std::to_string(GetLastError());return false;}WinHttpSetTimeouts(session,5000,10000,15000,15000);
-    HINTERNET conn=WinHttpConnect(session,host,port,0);HINTERNET req=conn?WinHttpOpenRequest(conn,L"GET",requestPath.c_str(),nullptr,L"https://www.youtube.com/",WINHTTP_DEFAULT_ACCEPT_TYPES,flags):nullptr;
-    bool ok=false;if(req&&WinHttpSendRequest(req,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(req,nullptr)){
-        DWORD status=0,size=sizeof(status);if(WinHttpQueryHeaders(req,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX)&&status==200){DWORD available=0;ok=true;while(WinHttpQueryDataAvailable(req,&available)&&available){if(data.size()+available>80u*1024u*1024u){error="WebM audio exceeds the 80 MiB safety limit.";ok=false;break;}size_t old=data.size();data.resize(old+available);DWORD got=0;if(!WinHttpReadData(req,&data[old],available,&got)){data.resize(old);error="Reading WebM audio failed: "+std::to_string(GetLastError());ok=false;break;}data.resize(old+got);if(!got)break;}}
-        else error="Audio download HTTP status "+std::to_string(status);
-    }else error="WebM audio request failed: "+std::to_string(GetLastError());
-    if(req)WinHttpCloseHandle(req);if(conn)WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return ok;
+    HINTERNET conn=WinHttpConnect(session,host,port,0);if(!conn){error="Opus download connection failed: "+std::to_string(GetLastError());WinHttpCloseHandle(session);return false;}
+    const uint64_t total=contentLengthFromUrl(url);if(total>kMaxDownloadBytes){error="WebM audio exceeds the 80 MiB safety limit.";WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return false;}
+    if(total)data.reserve((size_t)total);
+    bool ok=true;uint64_t offset=0;
+    while(ok){
+        uint64_t last=offset+kChunkBytes-1;if(total&&last>=total)last=total-1;
+        const std::wstring chunkPath=requestPath+L"&range="+std::to_wstring(offset)+L"-"+std::to_wstring(last);
+        DWORD status=0;const size_t before=data.size();bool got=fetchChunk(conn,chunkPath,flags,data,status,error);
+        if(!got&&status!=416&&!(status>=400&&status<500))got=fetchChunk(conn,chunkPath,flags,data,status,error);
+        if(!got){if(status==416&&offset>0&&!total){error.clear();break;}ok=false;break;}
+        const uint64_t received=data.size()-before;offset+=received;
+        if(total?offset>=total:received<kChunkBytes)break;
+        if(!received){error="Audio server returned an empty chunk at byte "+std::to_string(offset)+".";ok=false;}
+    }
+    if(ok&&total&&offset!=total){error="WebM download incomplete: "+std::to_string(offset)+" of "+std::to_string(total)+" bytes.";ok=false;}
+    WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return ok;
 }
 bool decodeBlockGroup(const std::vector<uint8_t>& b,const Element& group,uint64_t track,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,std::vector<uint8_t>& wav,uint64_t& bytes,std::string& error){
     for(size_t p=group.data;p<group.end;){Element e{};if(!element(b,p,group.end,e))return false;p=e.end;if(e.id==0xA1&&!readBlock(b,e.data,e.end,track,decoder,channels,preSkip,wav,bytes,error))return false;}return true;
