@@ -5,6 +5,6 @@
 #include "ytm/json.hpp"
 
 namespace ytm {
-std::string searchInnerTube(const std::wstring& query, std::string& log);
+std::string searchInnerTube(const std::wstring& query, std::string& log, const std::string& visitorData = {});
 std::vector<AudioFormat> resolveAudio(const std::string& videoId, std::string visitorData, std::string& log, bool& loginRequired);
 }

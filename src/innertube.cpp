@@ -17,18 +17,21 @@ const ClientProfile CLIENTS[] = {
 };
 std::string narrow(const wchar_t* value){int n=WideCharToMultiByte(CP_UTF8,0,value,-1,nullptr,0,nullptr,nullptr);std::string out(n?n:0,'\0');if(n){WideCharToMultiByte(CP_UTF8,0,value,-1,&out[0],n,nullptr,nullptr);out.pop_back();}return out;}
 }
-std::string searchInnerTube(const std::wstring& query, std::string& log) {
+std::string searchInnerTube(const std::wstring& query, std::string& log, const std::string& visitorData) {
     HINTERNET session = WinHttpOpen(L"Ytm32/0.1 (Windows NT)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { log += "WinHttpOpen failed; error=" + std::to_string(GetLastError()) + "\r\n"; return {}; }
     WinHttpSetTimeouts(session, 5000, 5000, 7000, 7000);
     std::string response;
     log += "Search client: WEB_REMIX 1.20250616.03.00\r\nEndpoint: music.youtube.com/youtubei/v1/search\r\n";
-    std::string body = "{\"context\":{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20250616.03.00\",\"hl\":\"es\",\"gl\":\"ES\"}},\"query\":\"" + jsonEscape(query) + "\"}";
+    std::string body = "{\"context\":{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":\"1.20250616.03.00\",\"hl\":\"es\",\"gl\":\"ES\"";
+    if(!visitorData.empty())body += ",\"visitorData\":\"" + jsonEscape(utf8(visitorData)) + "\"";
+    body += "}},\"query\":\"" + jsonEscape(query) + "\"}";
     HINTERNET conn = WinHttpConnect(session, L"music.youtube.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET req = conn ? WinHttpOpenRequest(conn, L"POST", L"/youtubei/v1/search?prettyPrint=false", nullptr, L"https://music.youtube.com/", WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
     DWORD error = ERROR_SUCCESS, status = 0;
     if (req) {
-        std::wstring headers = L"Content-Type: application/json; charset=utf-8\r\nOrigin: https://music.youtube.com\r\nReferer: https://music.youtube.com/\r\nX-YouTube-Client-Name: 67\r\nX-YouTube-Client-Version: 1.20250616.03.00\r\n";
+        std::wstring headers = L"Content-Type: application/json; charset=utf-8\r\nAccept: application/json\r\nAccept-Language: es-ES,es;q=0.9,en;q=0.8\r\nX-Goog-Api-Format-Version: 1\r\nX-YouTube-Client-Name: 67\r\nX-YouTube-Client-Version: 1.20250616.03.00\r\nX-Origin: https://music.youtube.com\r\nOrigin: https://music.youtube.com\r\nReferer: https://music.youtube.com/\r\n";
+        if(!visitorData.empty()){headers+=L"X-Goog-Visitor-Id: ";headers+=utf8(visitorData);headers+=L"\r\n";}
         const std::wstring auth=authenticatedHeaders(L"https://music.youtube.com");headers+=auth;
         log+=auth.empty()?"Session headers: none\r\n":"Session headers: attached (redacted)\r\n";
         BOOL sent = WinHttpSendRequest(req, headers.c_str(), (DWORD)-1, (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
@@ -99,7 +102,8 @@ std::string requestPlayer(const ClientProfile& client,const std::string& videoId
     HINTERNET req=conn?WinHttpOpenRequest(conn,L"POST",L"/youtubei/v1/player?key=AIzaSyAO_F4S2JSlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",nullptr,L"https://m.youtube.com/",WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE):nullptr;
     std::string response;
     if(req){
-        std::wstring headers=L"Content-Type: application/json; charset=utf-8\r\nX-YouTube-Client-Name: ";headers+=client.numericId;headers+=L"\r\nX-YouTube-Client-Version: ";headers+=client.version;headers+=L"\r\nUser-Agent: ";headers+=client.agent;headers+=L"\r\n";headers+=L"Origin: https://m.youtube.com\r\nReferer: https://m.youtube.com/\r\n";
+        std::wstring headers=L"Content-Type: application/json; charset=utf-8\r\nAccept: application/json\r\nAccept-Language: en-US,en;q=0.9\r\nX-Goog-Api-Format-Version: 1\r\nX-YouTube-Client-Name: ";headers+=client.numericId;headers+=L"\r\nX-YouTube-Client-Version: ";headers+=client.version;headers+=L"\r\nUser-Agent: ";headers+=client.agent;headers+=L"\r\n";headers+=L"X-Origin: https://m.youtube.com\r\nOrigin: https://m.youtube.com\r\nReferer: https://m.youtube.com/\r\n";
+        if(!visitorData.empty()){headers+=L"X-Goog-Visitor-Id: ";headers+=utf8(visitorData);headers+=L"\r\n";}
         std::wstring auth;
         if(clientName==L"ANDROID_VR"&&!bearer.empty()){auth=L"Authorization: Bearer "+bearer+L"\r\n";log+="Android VR OAuth Bearer: attached (redacted)\r\n";}
         else{auth=authenticatedHeaders(L"https://m.youtube.com");log+=auth.empty()?"Session headers: none\r\n":"Session headers: attached (redacted)\r\n";}

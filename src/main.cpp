@@ -38,18 +38,27 @@ constexpr UINT WM_PLAYBACK_READY = WM_APP + 2, WM_MEDIA_ENGINE_EVENT = WM_APP + 
 constexpr UINT WM_OAUTH_BEGIN_DONE = WM_APP + 4, WM_OAUTH_POLL_DONE = WM_APP + 5;
 constexpr UINT WM_OPUS_DECODE_DONE = WM_APP + 6;
 constexpr int ID_QUERY = 101, ID_SEARCH = 102, ID_RESULTS = 103, ID_STATUS = 104, ID_LOG = 105, ID_PLAY = 106, ID_PAUSE = 107, ID_LOGIN = 108;
+constexpr int ID_HOME = 109, ID_BROWSE = 110, ID_LIBRARY = 111, ID_FAVORITE = 112, ID_PREVIOUS = 113, ID_NEXT = 114, ID_OPEN_LOCAL = 115;
+constexpr int ID_QUICK_BASE = 120;
 constexpr int ID_COOKIE = 201, ID_OPEN_BROWSER = 202, ID_SAVE_SESSION = 203, ID_CLEAR_SESSION = 204, ID_CANCEL_SESSION = 205, ID_IMPORT_COOKIES = 206;
 constexpr int ID_OAUTH_BEGIN = 207, ID_OAUTH_VERIFY = 208;
 HWND g_window, g_query, g_results, g_status, g_search, g_logButton, g_loginButton, g_logWindow, g_logEdit, g_authWindow, g_cookieEdit, g_playButton, g_pauseButton;
+HWND g_homeButton, g_browseButton, g_libraryButton, g_localButton, g_favoriteButton, g_previousButton, g_nextButton, g_quickButtons[4];
 HWND g_oauthCode, g_authStatus;
 HFONT g_font, g_heading;
 COLORREF const BG = RGB(17, 19, 25), PANEL = RGB(25, 28, 36), TEXT = RGB(238, 240, 245), MUTED = RGB(155, 163, 178), ACCENT = RGB(255, 75, 93);
+COLORREF const SIDEBAR = RGB(21, 23, 30), SURFACE = RGB(31, 34, 43), SOFT_ACCENT = RGB(58, 42, 52);
 std::wstring g_lastLog;
 std::string g_searchVisitorData;
 struct SearchResultPayload { std::string body, log, visitorData; };
 struct PlaybackPayload { DWORD requestToken = 0; bool loginRequired = false; std::wstring title; std::vector<AudioFormat> formats; std::string log; };
 struct MediaEventPayload { DWORD_PTR param1; DWORD param2; };
 std::vector<YouTubeVideoResult> g_searchResults;
+std::vector<YouTubeVideoResult> g_favorites;
+std::vector<YouTubeVideoResult> g_queue;
+std::wstring g_nowPlaying;
+int g_view = 0; // 0 home, 1 search, 2 library
+size_t g_queueIndex = 0;
 std::vector<AudioFormat> g_activeFormats;
 size_t g_activeFormat = 0;
 DWORD g_playRequestToken = 0;
@@ -58,9 +67,102 @@ std::wstring g_oauthVerificationUrl;
 struct OAuthPayload { ytm::OAuthDeviceInfo info; };
 struct OpusDecodePayload { DWORD requestToken = 0; size_t formatIndex = 0; bool success = false; std::shared_ptr<std::vector<uint8_t>> wav = std::make_shared<std::vector<uint8_t>>(); std::string diagnostic; };
 bool g_mfStarted = false, g_comInitialized = false;
+bool g_isLocalPlayback = false;
 IMFMediaEngine* g_mediaEngine = nullptr;
 class MediaEngineCallback;
 MediaEngineCallback* g_mediaCallback = nullptr;
+void startPlayback(const YouTubeVideoResult& item);
+bool initializeMediaPlayer();
+void addLog(const std::wstring& line);
+
+std::wstring favoritesPath() {
+    wchar_t base[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, nullptr, SHGFP_TYPE_CURRENT, base))) return {};
+    std::wstring dir = base; dir += L"\\Ytm32"; CreateDirectoryW(dir.c_str(), nullptr); return dir + L"\\favorites.txt";
+}
+std::string utf8Bytes(const std::wstring& value) {
+    if (value.empty()) return {};
+    int count = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), (int)value.size(), nullptr, 0, nullptr, nullptr);
+    std::string result(count, '\0');
+    if (count) WideCharToMultiByte(CP_UTF8, 0, value.c_str(), (int)value.size(), &result[0], count, nullptr, nullptr);
+    return result;
+}
+void saveFavorites() {
+    const std::wstring path = favoritesPath(); if (path.empty()) return;
+    std::string data;
+    for (const auto& item : g_favorites) data += item.videoId + "\t" + utf8Bytes(item.display) + "\n";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) { DWORD written = 0; WriteFile(file, data.data(), (DWORD)data.size(), &written, nullptr); CloseHandle(file); }
+}
+void loadFavorites() {
+    const std::wstring path = favoritesPath(); if (path.empty()) return;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD size = GetFileSize(file, nullptr); if (!size || size > 1024 * 1024) { CloseHandle(file); return; }
+    std::string data(size, '\0'); DWORD got = 0; bool ok = ReadFile(file, &data[0], size, &got, nullptr) && got == size; CloseHandle(file); if (!ok) return;
+    size_t at = 0;
+    while (at < data.size()) {
+        size_t end = data.find('\n', at); if (end == std::string::npos) end = data.size();
+        std::string line = data.substr(at, end - at); at = end + 1;
+        size_t tab = line.find('\t'); if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) continue;
+        std::string id = line.substr(0, tab); std::wstring title = utf8(line.substr(tab + 1));
+        if (title.empty()) continue;
+        g_favorites.push_back({std::move(title), std::move(id)});
+    }
+}
+const std::vector<YouTubeVideoResult>& visibleRows() { return g_view == 2 ? g_favorites : g_searchResults; }
+void refreshRows() {
+    if (!g_results) return;
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0);
+    const auto& rows = visibleRows();
+    for (const auto& row : rows) SendMessage(g_results, LB_ADDSTRING, 0, (LPARAM)row.display.c_str());
+    ShowWindow(g_results, g_view == 2 || (g_view == 1 && !rows.empty()) ? SW_SHOW : SW_HIDE);
+    EnableWindow(g_favoriteButton, g_view != 0 && SendMessage(g_results, LB_GETCOUNT, 0, 0) > 0);
+    if(g_window)InvalidateRect(g_window, nullptr, FALSE);
+}
+void setView(int view) {
+    g_view = view;
+    ShowWindow(g_query, view == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_search, view == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_results, view == 2 || (view == 1 && !g_searchResults.empty()) ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_favoriteButton, view == 2 || view == 1 ? SW_SHOW : SW_HIDE);
+    for(HWND button:g_quickButtons)ShowWindow(button,view==0?SW_SHOW:SW_HIDE);
+    ShowWindow(g_status,SW_HIDE);
+    InvalidateRect(g_homeButton,nullptr,TRUE);InvalidateRect(g_browseButton,nullptr,TRUE);InvalidateRect(g_libraryButton,nullptr,TRUE);
+    if (view == 2) SetWindowText(g_status, L"Tu música · favoritos guardados en este equipo");
+    else if (view == 0) SetWindowText(g_status, L"Inicio · descubre algo para escuchar");
+    else if (g_searchResults.empty()) SetWindowText(g_status, L"Busca canciones, artistas o álbumes");
+    refreshRows();
+}
+void toggleFavorite(const YouTubeVideoResult& item) {
+    const YouTubeVideoResult savedItem=item;
+    auto found = std::find_if(g_favorites.begin(), g_favorites.end(), [&](const YouTubeVideoResult& saved) { return saved.videoId == savedItem.videoId; });
+    if (found == g_favorites.end()) { g_favorites.push_back(savedItem); addLog(L"Añadido a Mi música: " + savedItem.display); }
+    else { g_favorites.erase(found); addLog(L"Quitado de Mi música: " + savedItem.display); }
+    saveFavorites(); refreshRows();
+}
+void playQueueOffset(int offset) {
+    if (g_queue.empty()) return;
+    long long next = (long long)g_queueIndex + offset;
+    if (next < 0 || next >= (long long)g_queue.size()) return;
+    g_queueIndex = (size_t)next;EnableWindow(g_previousButton,g_queueIndex>0);EnableWindow(g_nextButton,g_queueIndex+1<g_queue.size());startPlayback(g_queue[g_queueIndex]);
+}
+void playVisibleIndex(int index) {
+    const auto& rows = visibleRows();
+    if (index < 0 || (size_t)index >= rows.size()) return;
+    g_queue = rows; g_queueIndex = (size_t)index;EnableWindow(g_previousButton,g_queueIndex>0);EnableWindow(g_nextButton,g_queueIndex+1<g_queue.size());startPlayback(g_queue[g_queueIndex]);
+}
+void openLocalAudio() {
+    wchar_t path[32768]{};
+    OPENFILENAMEW picker{};picker.lStructSize=sizeof(picker);picker.hwndOwner=g_window;picker.lpstrFilter=L"Archivos de audio\0Archivos compatibles (*.mp3;*.wav;*.wma;*.m4a;*.aac)\0*.mp3;*.wav;*.wma;*.m4a;*.aac\0Todos los archivos\0*.*\0\0";picker.lpstrFile=path;picker.nMaxFile=(DWORD)(sizeof(path)/sizeof(path[0]));picker.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_HIDEREADONLY;picker.lpstrTitle=L"Abrir archivo de audio";
+    if(!GetOpenFileNameW(&picker))return;
+    if(!initializeMediaPlayer()){SetWindowText(g_status,L"No se pudo iniciar el reproductor de Windows.");return;}
+    wchar_t fileUrl[32768]{};DWORD capacity=(DWORD)(sizeof(fileUrl)/sizeof(fileUrl[0]));HRESULT hr=UrlCreateFromPathW(path,fileUrl,&capacity,0);
+    if(FAILED(hr)){SetWindowText(g_status,L"No se pudo abrir el archivo seleccionado.");return;}
+    BSTR source=SysAllocString(fileUrl);hr=source?g_mediaEngine->SetSource(source):E_OUTOFMEMORY;if(source)SysFreeString(source);if(SUCCEEDED(hr))hr=g_mediaEngine->Play();
+    if(FAILED(hr)){SetWindowText(g_status,L"Windows no pudo reproducir este formato de audio.");addLog(L"Falló la reproducción del archivo local.");return;}
+    g_isLocalPlayback=true;g_activeFormats.clear();g_queue.clear();g_nowPlaying=PathFindFileNameW(path);EnableWindow(g_playButton,TRUE);EnableWindow(g_previousButton,FALSE);EnableWindow(g_nextButton,FALSE);EnableWindow(g_pauseButton,TRUE);SetWindowText(g_status,L"Reproduciendo archivo local");InvalidateRect(g_window,nullptr,FALSE);addLog(L"Reproducción local: "+g_nowPlaying);
+}
 
 void refreshLog() {
     if (g_logEdit) { SetWindowText(g_logEdit, g_lastLog.c_str()); SendMessage(g_logEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1); SendMessage(g_logEdit, EM_SCROLLCARET, 0, 0); }
@@ -71,6 +173,7 @@ void addLog(const std::wstring& line) {
     wchar_t stamp[24]{}; wsprintf(stamp, L"[%02u:%02u:%02u] ", now.wHour, now.wMinute, now.wSecond);
     g_lastLog += stamp; g_lastLog += line; g_lastLog += L"\r\n";
     refreshLog();
+    if(g_window)InvalidateRect(g_window,nullptr,FALSE);
 }
 LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     static WNDPROC old = nullptr;
@@ -149,6 +252,7 @@ void loadFormat(size_t index){
     SetWindowText(g_status,(L"Cargando audio itag "+std::to_wstring(g_activeFormats[index].itag)+L"…").c_str());
 }
 void startPlayback(const YouTubeVideoResult& item){
+    g_isLocalPlayback=false;g_nowPlaying=item.display;EnableWindow(g_playButton,TRUE);InvalidateRect(g_window,nullptr,FALSE);
     SetWindowText(g_status,(L"Resolviendo: "+item.display).c_str());
     addLog(L"Resolviendo reproducción: "+item.display);
     const std::string videoId=item.videoId;const std::wstring title=item.display;const DWORD requestToken=++g_playRequestToken;const std::string visitorData=g_searchVisitorData;
@@ -157,14 +261,16 @@ void startPlayback(const YouTubeVideoResult& item){
 void startSearch() {
     wchar_t q[512]{}; GetWindowText(g_query, q, 512);
     if (!*q) { SetWindowText(g_status,L"Escribe un título, artista o consulta para buscar."); SetFocus(g_query); addLog(L"Búsqueda cancelada: el campo está vacío."); return; }
+    setView(1);
     EnableWindow(g_search, FALSE); EnableWindow(g_playButton,FALSE); SetWindowText(g_status, L"Buscando en YouTube…");
     g_lastLog.clear(); addLog(L"Buscando videos de YouTube: "+std::wstring(q));
     std::wstring query(q);
-    std::thread([query] {
+    const std::string visitorData=g_searchVisitorData;
+    std::thread([query,visitorData] {
         std::string log;
-        auto body = searchInnerTube(query, log);
-        std::string visitorData=visitorDataFromJson(body);
-        auto* payload = new SearchResultPayload{std::move(body), std::move(log), std::move(visitorData)};
+        auto body = searchInnerTube(query, log, visitorData);
+        std::string responseVisitorData=visitorDataFromJson(body);
+        auto* payload = new SearchResultPayload{std::move(body), std::move(log), std::move(responseVisitorData)};
         if (!PostMessage(g_window, WM_SEARCH_DONE, 0, (LPARAM)payload)) delete payload;
     }).detach();
 }
@@ -242,47 +348,102 @@ void showLog() {
 void paint(HWND h) {
     PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT r; GetClientRect(h, &r);
     HBRUSH b = CreateSolidBrush(BG); FillRect(dc, &r, b); DeleteObject(b);
-    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, TEXT); SelectObject(dc, g_heading);
-    RECT title{32, 26, r.right - 32, 68}; DrawText(dc, L"YT MUSIC", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dc, g_font); SetTextColor(dc, MUTED);
-    RECT sub{33, 65, r.right - 30, 92}; DrawText(dc, L"Busca, selecciona un resultado y pulsa Reproducir", -1, &sub, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SetTextColor(dc, TEXT); RECT searchLabel{32, 94, r.right - 32, 110}; DrawText(dc, L"BÚSQUEDA", -1, &searchLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT resultsLabel{32, 155, r.right - 32, 174}; DrawText(dc, L"RESULTADOS  ·  doble clic también reproduce", -1, &resultsLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT side{0,0,176,r.bottom}; HBRUSH sb=CreateSolidBrush(SIDEBAR); FillRect(dc,&side,sb); DeleteObject(sb);
+    HPEN pen=CreatePen(PS_SOLID,1,RGB(46,48,58)); HGDIOBJ oldPen=SelectObject(dc,pen); MoveToEx(dc,176,0,nullptr); LineTo(dc,176,r.bottom); SelectObject(dc,oldPen); DeleteObject(pen);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, ACCENT); SelectObject(dc, g_heading);
+    RECT brand{22,25,158,64}; DrawText(dc,L"♪  YTM32",-1,&brand,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    SelectObject(dc,g_font);SetTextColor(dc,MUTED);RECT brandSub{23,59,158,80};DrawText(dc,L"MUSIC PLAYER",-1,&brandSub,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    SetTextColor(dc,TEXT);SelectObject(dc,g_heading);
+    RECT title{202, 34, r.right - 190, 72};
+    const wchar_t* pageTitle=g_view==0?L"Buenas tardes":g_view==1?L"Explorar música":L"Mi música";
+    DrawText(dc,pageTitle,-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    SelectObject(dc,g_font);SetTextColor(dc,MUTED);
+    RECT sub{204,72,r.right-190,98};
+    const wchar_t* subtitle=g_view==0?L"Tu rincón para descubrir y escuchar":g_view==1?L"Busca canciones, artistas o álbumes":L"Tus favoritos, guardados en este equipo";
+    DrawText(dc,subtitle,-1,&sub,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    if(g_view==0){
+        SetTextColor(dc,TEXT);RECT section{204,178,r.right-36,208};DrawText(dc,L"QUICK PICKS",-1,&section,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        SetTextColor(dc,MUTED);RECT hint{204,208,r.right-36,232};DrawText(dc,L"Un toque para encontrar algo nuevo",-1,&hint,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    }else if(g_view==1){
+        SetTextColor(dc,MUTED);RECT section{204,154,r.right-36,178};DrawText(dc,L"RESULTADOS  ·  doble clic para reproducir",-1,&section,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    }else{
+        SetTextColor(dc,MUTED);RECT section{204,154,r.right-36,178};DrawText(dc,L"TUS CANCIONES GUARDADAS",-1,&section,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        if(g_favorites.empty()){SetTextColor(dc,TEXT);RECT empty{204,220,r.right-36,280};DrawText(dc,L"Aún no has guardado canciones. Explora y pulsa ♡ para añadir una.",-1,&empty,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);}
+    }
+    RECT player{176,r.bottom-94,r.right,r.bottom};HBRUSH pb=CreateSolidBrush(SURFACE);FillRect(dc,&player,pb);DeleteObject(pb);
+    HPEN ppen=CreatePen(PS_SOLID,1,RGB(50,52,62));oldPen=SelectObject(dc,ppen);MoveToEx(dc,176,r.bottom-94,nullptr);LineTo(dc,r.right,r.bottom-94);SelectObject(dc,oldPen);DeleteObject(ppen);
+    RECT art{196,r.bottom-77,246,r.bottom-27};HBRUSH ab=CreateSolidBrush(SOFT_ACCENT);FillRect(dc,&art,ab);DeleteObject(ab);
+    SetTextColor(dc,ACCENT);RECT note=art;DrawText(dc,L"♪",-1,&note,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    SetTextColor(dc,TEXT);RECT track{258,r.bottom-72,520,r.bottom-48};DrawText(dc,g_nowPlaying.empty()?L"Elige algo para reproducir":g_nowPlaying.c_str(),-1,&track,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    SetTextColor(dc,MUTED);RECT artist{258,r.bottom-47,560,r.bottom-26};wchar_t statusText[256]{};GetWindowText(g_status,statusText,256);DrawText(dc,statusText[0]?statusText:L"YouTube Music · Reproductor ligero",-1,&artist,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
     EndPaint(h, &ps);
 }
 LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
         g_font = CreateFont(16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        g_heading = CreateFont(25,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        g_loginButton=CreateWindowEx(0,L"BUTTON",L"Iniciar sesión",WS_CHILD|WS_VISIBLE|WS_TABSTOP,480,30,120,30,h,(HMENU)ID_LOGIN,nullptr,nullptr);
-        g_query = CreateWindowEx(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,32,112,430,36,h,(HMENU)ID_QUERY,nullptr,nullptr);
-        g_search = CreateWindowEx(0,L"BUTTON",L"Buscar",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,472,112,108,36,h,(HMENU)ID_SEARCH,nullptr,nullptr);
-        g_results = CreateWindowEx(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,32,180,548,294,h,(HMENU)ID_RESULTS,nullptr,nullptr);
-        g_status = CreateWindowEx(0,L"STATIC",L"Preparado · busca una canción o artista",WS_CHILD|WS_VISIBLE,32,510,258,28,h,(HMENU)ID_STATUS,nullptr,nullptr);
-        g_playButton = CreateWindowEx(0,L"BUTTON",L"Reproducir",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,290,486,112,34,h,(HMENU)ID_PLAY,nullptr,nullptr);
-        g_pauseButton = CreateWindowEx(0,L"BUTTON",L"Pausa",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,410,486,92,34,h,(HMENU)ID_PAUSE,nullptr,nullptr);
-        g_logButton = CreateWindowEx(0,L"BUTTON",L"Registro",WS_CHILD|WS_VISIBLE|WS_TABSTOP,510,486,90,34,h,(HMENU)ID_LOG,nullptr,nullptr);
+        g_heading = CreateFont(28,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+        g_homeButton=CreateWindowEx(0,L"BUTTON",L"⌂   Inicio",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,12,112,152,42,h,(HMENU)ID_HOME,nullptr,nullptr);
+        g_browseButton=CreateWindowEx(0,L"BUTTON",L"⌕   Explorar",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,12,158,152,42,h,(HMENU)ID_BROWSE,nullptr,nullptr);
+        g_libraryButton=CreateWindowEx(0,L"BUTTON",L"♫   Mi música",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,12,204,152,42,h,(HMENU)ID_LIBRARY,nullptr,nullptr);
+        g_localButton=CreateWindowEx(0,L"BUTTON",L"＋   Abrir archivo",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,12,250,152,42,h,(HMENU)ID_OPEN_LOCAL,nullptr,nullptr);
+        g_loginButton=CreateWindowEx(0,L"BUTTON",L"Iniciar sesión",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,16,310,144,34,h,(HMENU)ID_LOGIN,nullptr,nullptr);
+        g_logButton=CreateWindowEx(0,L"BUTTON",L"Registro",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,16,350,144,34,h,(HMENU)ID_LOG,nullptr,nullptr);
+        g_query = CreateWindowEx(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,204,112,560,36,h,(HMENU)ID_QUERY,nullptr,nullptr);
+        g_search = CreateWindowEx(0,L"BUTTON",L"Buscar",WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,774,112,108,36,h,(HMENU)ID_SEARCH,nullptr,nullptr);
+        g_results = CreateWindowEx(0,L"LISTBOX",L"",WS_CHILD|WS_VSCROLL|WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS,204,190,678,420,h,(HMENU)ID_RESULTS,nullptr,nullptr);
+        SendMessage(g_results,LB_SETITEMHEIGHT,0,58);
+        g_status = CreateWindowEx(0,L"STATIC",L"Inicio · descubre algo para escuchar",WS_CHILD|WS_VISIBLE,530,0,300,28,h,(HMENU)ID_STATUS,nullptr,nullptr);
+        g_favoriteButton=CreateWindowEx(0,L"BUTTON",L"♡ Guardar favorito",WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,204,146,170,34,h,(HMENU)ID_FAVORITE,nullptr,nullptr);
+        g_previousButton=CreateWindowEx(0,L"BUTTON",L"|◀",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,610,0,48,42,h,(HMENU)ID_PREVIOUS,nullptr,nullptr);
+        g_playButton = CreateWindowEx(0,L"BUTTON",L"▶",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,666,0,48,42,h,(HMENU)ID_PLAY,nullptr,nullptr);
+        g_pauseButton = CreateWindowEx(0,L"BUTTON",L"Ⅱ",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,722,0,48,42,h,(HMENU)ID_PAUSE,nullptr,nullptr);
+        g_nextButton=CreateWindowEx(0,L"BUTTON",L"▶|",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,778,0,48,42,h,(HMENU)ID_NEXT,nullptr,nullptr);
+        const wchar_t* quickLabels[4]={L"Para descubrir",L"Novedades",L"Rock clásico",L"Instrumental"};
+        for(int i=0;i<4;++i)g_quickButtons[i]=CreateWindowEx(0,L"BUTTON",quickLabels[i],WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,204+i*170,250,158,116,h,(HMENU)(ID_QUICK_BASE+i),nullptr,nullptr);
         EnableWindow(g_playButton,FALSE); EnableWindow(g_pauseButton,FALSE);
-        for (HWND c : {g_query,g_results,g_status,g_logButton,g_loginButton,g_playButton,g_pauseButton}) SendMessage(c,WM_SETFONT,(WPARAM)g_font,TRUE);
+        EnableWindow(g_previousButton,FALSE);EnableWindow(g_nextButton,FALSE);
+        for (HWND c : {g_query,g_results,g_status,g_logButton,g_loginButton,g_playButton,g_pauseButton,g_homeButton,g_browseButton,g_libraryButton,g_localButton,g_favoriteButton,g_previousButton,g_nextButton}) SendMessage(c,WM_SETFONT,(WPARAM)g_font,TRUE);
+        for(HWND c:g_quickButtons)SendMessage(c,WM_SETFONT,(WPARAM)g_font,TRUE);
         SetWindowLongPtr(g_query,GWLP_USERDATA,GetWindowLongPtr(g_query,GWLP_WNDPROC)); SetWindowLongPtr(g_query,GWLP_WNDPROC,(LONG_PTR)EditProc);
+        loadFavorites(); setView(0);
         return 0;
     }
     case WM_COMMAND:
         if (LOWORD(w)==ID_SEARCH) { if(HIWORD(w)==BN_CLICKED)startSearch(); return 0; }
+        if (LOWORD(w)==ID_HOME) { setView(0); return 0; }
+        if (LOWORD(w)==ID_BROWSE) { setView(1); SetFocus(g_query); return 0; }
+        if (LOWORD(w)==ID_LIBRARY) { setView(2); return 0; }
+        if (LOWORD(w)==ID_OPEN_LOCAL) { openLocalAudio(); return 0; }
+        if (LOWORD(w)>=ID_QUICK_BASE&&LOWORD(w)<ID_QUICK_BASE+4) {
+            const wchar_t* queries[4]={L"canciones para descubrir",L"nuevas canciones",L"rock clásico",L"música instrumental"};
+            SetWindowText(g_query,queries[LOWORD(w)-ID_QUICK_BASE]);setView(1);startSearch();return 0;
+        }
         if (LOWORD(w)==ID_LOGIN) { showAuth(); return 0; }
         if (LOWORD(w)==ID_LOG) { showLog(); return 0; }
-        if (LOWORD(w)==ID_PLAY) { int index=(int)SendMessage(g_results,LB_GETCURSEL,0,0);if(index>=0&&(size_t)index<g_searchResults.size())startPlayback(g_searchResults[index]);else{SetWindowText(g_status,L"Selecciona primero una canción de la lista.");addLog(L"Reproducción solicitada sin un resultado seleccionado.");}return 0; }
+        if (LOWORD(w)==ID_FAVORITE) { int index=(int)SendMessage(g_results,LB_GETCURSEL,0,0);const auto& rows=visibleRows();if(index>=0&&(size_t)index<rows.size())toggleFavorite(rows[index]);return 0; }
+        if (LOWORD(w)==ID_PLAY) { if(!g_queue.empty())startPlayback(g_queue[g_queueIndex]);else playVisibleIndex((int)SendMessage(g_results,LB_GETCURSEL,0,0));return 0; }
         if (LOWORD(w)==ID_PAUSE&&g_mediaEngine) { if(!g_mediaEngine->IsPaused()){g_mediaEngine->Pause();SetWindowText(g_pauseButton,L"Reanudar");}else{g_mediaEngine->Play();SetWindowText(g_pauseButton,L"Pausa");}return 0; }
-        if (LOWORD(w)==ID_RESULTS&&HIWORD(w)==LBN_SELCHANGE) { int index=(int)SendMessage(g_results,LB_GETCURSEL,0,0);EnableWindow(g_playButton,index!=LB_ERR);if(index>=0&&(size_t)index<g_searchResults.size())SetWindowText(g_status,(L"Seleccionado · "+g_searchResults[index].display+L" · pulsa Reproducir").c_str());return 0; }
-        if (LOWORD(w)==ID_RESULTS&&HIWORD(w)==LBN_DBLCLK) { int index=(int)SendMessage(g_results,LB_GETCURSEL,0,0);if(index>=0&&(size_t)index<g_searchResults.size())startPlayback(g_searchResults[index]);return 0; }
+        if (LOWORD(w)==ID_PREVIOUS) { playQueueOffset(-1);return 0; }
+        if (LOWORD(w)==ID_NEXT) { playQueueOffset(1);return 0; }
+        if (LOWORD(w)==ID_RESULTS&&HIWORD(w)==LBN_SELCHANGE) {
+            int index=(int)SendMessage(g_results,LB_GETCURSEL,0,0);const auto& rows=visibleRows();EnableWindow(g_playButton,index!=LB_ERR);
+            if(index>=0&&(size_t)index<rows.size()){
+                g_queue=rows;g_queueIndex=(size_t)index;SetWindowText(g_status,(L"Seleccionado · "+rows[index].display).c_str());
+                auto fav=std::find_if(g_favorites.begin(),g_favorites.end(),[&](const YouTubeVideoResult& r){return r.videoId==rows[index].videoId;});
+                SetWindowText(g_favoriteButton,fav==g_favorites.end()?L"♡ Guardar favorito":L"♥ Quitar favorito");
+                EnableWindow(g_previousButton,g_queueIndex>0);EnableWindow(g_nextButton,g_queueIndex+1<g_queue.size());
+            }return 0;
+        }
+        if (LOWORD(w)==ID_RESULTS&&HIWORD(w)==LBN_DBLCLK) { playVisibleIndex((int)SendMessage(g_results,LB_GETCURSEL,0,0));return 0; }
         break;
     case WM_SEARCH_DONE: {
         std::unique_ptr<SearchResultPayload> p(reinterpret_cast<SearchResultPayload*>(l));
         g_searchVisitorData=p->visitorData;
         if(!g_searchVisitorData.empty())addLog(L"VisitorData recibido en la búsqueda.");
-        EnableWindow(g_search, TRUE); EnableWindow(g_playButton,FALSE); SendMessage(g_results,LB_RESETCONTENT,0,0);
+        EnableWindow(g_search, TRUE); EnableWindow(g_playButton,FALSE); EnableWindow(g_previousButton,FALSE); EnableWindow(g_nextButton,FALSE);
         g_searchResults.clear();
+        refreshRows();
         std::wstring details = utf8(p->log);
         std::vector<YouTubeVideoResult> rows;
         bool jsonParsed = false;
@@ -290,7 +451,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else {
             rows = parseVideoSearchResults(p->body,jsonParsed);
             g_searchResults=rows;
-            for (const auto& row : rows) SendMessage(g_results,LB_ADDSTRING,0,(LPARAM)row.display.c_str());
+            refreshRows();
             std::wstring status = !jsonParsed ? L"La respuesta no contiene JSON válido. Abre Registro." : rows.empty() ? L"YouTube respondió, pero no se encontraron videos." : std::to_wstring(rows.size())+L" videos · selecciona uno y pulsa Reproducir.";
             SetWindowText(g_status,status.c_str());
             details += L"\r\nParser recognized rows: " + std::to_wstring(rows.size()) + L"\r\n";
@@ -325,25 +486,43 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const DWORD event=(DWORD)w;
         std::unique_ptr<MediaEventPayload> eventInfo(reinterpret_cast<MediaEventPayload*>(l));
         if(event==MF_MEDIA_ENGINE_EVENT_PLAYING){
-            if(g_activeFormat<g_activeFormats.size()){SetWindowText(g_status,(L"Reproduciendo · audio itag "+std::to_wstring(g_activeFormats[g_activeFormat].itag)).c_str());addLog(L"Reproducción iniciada correctamente.");}
+            if(g_isLocalPlayback)SetWindowText(g_status,L"Reproduciendo archivo local");else if(g_activeFormat<g_activeFormats.size())SetWindowText(g_status,(L"Reproduciendo · audio itag "+std::to_wstring(g_activeFormats[g_activeFormat].itag)).c_str());
+            InvalidateRect(g_window,nullptr,FALSE);addLog(L"Reproducción iniciada correctamente.");
         }else if(event==MF_MEDIA_ENGINE_EVENT_ERROR){
             const DWORD_PTR p1=eventInfo?eventInfo->param1:0;const DWORD p2=eventInfo?eventInfo->param2:0;
             addLog(L"Media Engine informó error. Parámetros: "+std::to_wstring((unsigned long)p1)+L", "+std::to_wstring(p2));
-            if(g_activeFormat+1<g_activeFormats.size()){
+            if(!g_isLocalPlayback&&g_activeFormat+1<g_activeFormats.size()){
                 ++g_activeFormat;addLog(L"Probando formato alternativo itag "+std::to_wstring(g_activeFormats[g_activeFormat].itag));loadFormat(g_activeFormat);
             }else{
                 SetWindowText(g_status,L"Error al reproducir. Abre Registro para ver los detalles.");
             }
-        }else if(event==MF_MEDIA_ENGINE_EVENT_STALLED||event==MF_MEDIA_ENGINE_EVENT_WAITING){SetWindowText(g_status,L"Esperando datos de audio…");}
+        }else if(event==MF_MEDIA_ENGINE_EVENT_STALLED||event==MF_MEDIA_ENGINE_EVENT_WAITING){SetWindowText(g_status,L"Esperando datos de audio…");InvalidateRect(g_window,nullptr,FALSE);}
+        else if(event==MF_MEDIA_ENGINE_EVENT_ENDED){playQueueOffset(1);}
         else if(event==MF_MEDIA_ENGINE_EVENT_ABORT){addLog(L"La carga del audio fue cancelada.");}
         return 0;
     }
     case WM_DRAWITEM: {
-        auto* d=(DRAWITEMSTRUCT*)l; HBRUSH br=CreateSolidBrush(d->itemState&ODS_SELECTED?RGB(58,40,48):PANEL); FillRect(d->hDC,&d->rcItem,br); DeleteObject(br);
-        SetBkMode(d->hDC,TRANSPARENT); SetTextColor(d->hDC,TEXT); SelectObject(d->hDC,g_font);
-        if(d->CtlID==ID_SEARCH) { RECT x=d->rcItem; DrawText(d->hDC,L"Buscar",-1,&x,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
-        else if(d->CtlID==ID_PLAY||d->CtlID==ID_PAUSE) { wchar_t label[32]{};GetWindowText(d->hwndItem,label,32);RECT x=d->rcItem;DrawText(d->hDC,label,-1,&x,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
-        else if(d->itemID!=UINT(-1)) { wchar_t buf[512]; SendMessage(d->hwndItem,LB_GETTEXT,d->itemID,(LPARAM)buf); RECT x=d->rcItem; x.left+=12; DrawText(d->hDC,buf,-1,&x,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS); }
+        auto* d=(DRAWITEMSTRUCT*)l;const bool selected=(d->itemState&ODS_SELECTED)!=0;COLORREF color=selected?SOFT_ACCENT:PANEL;
+        if(d->CtlID==ID_HOME&&g_view==0||d->CtlID==ID_BROWSE&&g_view==1||d->CtlID==ID_LIBRARY&&g_view==2)color=SOFT_ACCENT;
+        if(d->CtlID>=ID_QUICK_BASE&&d->CtlID<ID_QUICK_BASE+4)color=selected?RGB(67,49,61):SURFACE;
+        if(d->CtlID==ID_SEARCH||d->CtlID==ID_PLAY)color=ACCENT;
+        HBRUSH br=CreateSolidBrush(color);FillRect(d->hDC,&d->rcItem,br);DeleteObject(br);
+        SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,(d->CtlID==ID_HOME&&g_view==0||d->CtlID==ID_BROWSE&&g_view==1||d->CtlID==ID_LIBRARY&&g_view==2)?RGB(255,190,198):TEXT);SelectObject(d->hDC,g_font);
+        if(d->CtlType==ODT_LISTBOX&&d->itemID!=UINT(-1)){
+            wchar_t buf[512]{};SendMessage(d->hwndItem,LB_GETTEXT,d->itemID,(LPARAM)buf);RECT row=d->rcItem;row.left+=16;row.right-=12;
+            std::wstring line=buf;size_t split=line.find(L"  —  ");std::wstring title=split==std::wstring::npos?line:line.substr(0,split);std::wstring artist=split==std::wstring::npos?L"YouTube Music":line.substr(split+5);
+            SetTextColor(d->hDC,TEXT);RECT primary=row;primary.top+=5;primary.bottom=row.top+31;DrawText(d->hDC,title.c_str(),-1,&primary,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+            SetTextColor(d->hDC,MUTED);RECT secondary=row;secondary.top+=30;DrawText(d->hDC,artist.c_str(),-1,&secondary,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+            HPEN divider=CreatePen(PS_SOLID,1,RGB(48,50,59));HGDIOBJ old=SelectObject(d->hDC,divider);MoveToEx(d->hDC,row.left,row.bottom-1,nullptr);LineTo(d->hDC,row.right,row.bottom-1);SelectObject(d->hDC,old);DeleteObject(divider);return TRUE;
+        }
+        if(d->CtlID>=ID_QUICK_BASE&&d->CtlID<ID_QUICK_BASE+4){
+            const wchar_t* titles[4]={L"Para descubrir",L"Novedades",L"Rock clásico",L"Instrumental"};const wchar_t* icons[4]={L"✦",L"♫",L"◈",L"☼"};int i=d->CtlID-ID_QUICK_BASE;
+            SetTextColor(d->hDC,ACCENT);RECT icon=d->rcItem;icon.left+=14;icon.top+=10;icon.bottom=icon.top+46;DrawText(d->hDC,icons[i],-1,&icon,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            SetTextColor(d->hDC,TEXT);RECT title=d->rcItem;title.left+=14;title.top+=58;DrawText(d->hDC,titles[i],-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE);return TRUE;
+        }
+        wchar_t label[64]{};GetWindowText(d->hwndItem,label,64);RECT text=d->rcItem;
+        if(d->CtlID==ID_HOME||d->CtlID==ID_BROWSE||d->CtlID==ID_LIBRARY||d->CtlID==ID_OPEN_LOCAL||d->CtlID==ID_LOGIN||d->CtlID==ID_LOG||d->CtlID==ID_FAVORITE){text.left+=12;DrawText(d->hDC,label,-1,&text,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);}
+        else DrawText(d->hDC,label,-1,&text,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         return TRUE;
     }
     case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: case WM_CTLCOLORSTATIC: {
@@ -351,7 +530,16 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paint(h); return 0;
-    case WM_SIZE: { int width=LOWORD(l); MoveWindow(g_loginButton,width-152,29,120,30,TRUE); MoveWindow(g_query,32,112,width-180,36,TRUE); MoveWindow(g_search,width-140,112,108,36,TRUE); MoveWindow(g_results,32,180,width-64,HIWORD(l)-230,TRUE); MoveWindow(g_status,32,HIWORD(l)-38,width-392,24,TRUE); MoveWindow(g_playButton,width-360,HIWORD(l)-42,112,34,TRUE); MoveWindow(g_pauseButton,width-240,HIWORD(l)-42,92,34,TRUE); MoveWindow(g_logButton,width-140,HIWORD(l)-42,108,34,TRUE); return 0; }
+    case WM_SIZE: {
+        int width=LOWORD(l),height=HIWORD(l),content=width-220,playerTop=height-94;
+        MoveWindow(g_query,204,112,std::max(180,content-128),38,TRUE);MoveWindow(g_search,width-112,112,88,38,TRUE);
+        MoveWindow(g_favoriteButton,204,154,170,34,TRUE);MoveWindow(g_results,204,194,std::max(180,content),std::max(80,playerTop-210),TRUE);
+        for(int i=0;i<4;++i){int gap=12,cardWidth=std::max(105,(content-gap*3)/4);MoveWindow(g_quickButtons[i],204+i*(cardWidth+gap),254,cardWidth,116,TRUE);}
+        MoveWindow(g_status,204,playerTop-30,std::max(180,content-16),22,TRUE);
+        int center=176+(width-176)/2;MoveWindow(g_previousButton,center-106,playerTop+26,42,42,TRUE);MoveWindow(g_playButton,center-54,playerTop+26,42,42,TRUE);MoveWindow(g_pauseButton,center+8,playerTop+26,42,42,TRUE);MoveWindow(g_nextButton,center+60,playerTop+26,42,42,TRUE);
+        return 0;
+    }
+    case WM_GETMINMAXINFO: { auto* info=(MINMAXINFO*)l;info->ptMinTrackSize.x=780;info->ptMinTrackSize.y=560;return 0; }
     case WM_DESTROY:
         if(g_mediaEngine){g_mediaEngine->Shutdown();g_mediaEngine->Release();g_mediaEngine=nullptr;}
         if(g_mediaCallback){g_mediaCallback->Release();g_mediaCallback=nullptr;}
@@ -370,7 +558,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     WNDCLASSEX logClass{sizeof(logClass)}; logClass.lpfnWndProc=logProc; logClass.hInstance=instance; logClass.hCursor=LoadCursor(nullptr,IDC_ARROW); logClass.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); logClass.lpszClassName=L"Ytm32Log"; RegisterClassEx(&logClass);
     WNDCLASSEX authClass{sizeof(authClass)}; authClass.lpfnWndProc=authProc; authClass.hInstance=instance; authClass.hCursor=LoadCursor(nullptr,IDC_ARROW); authClass.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); authClass.lpszClassName=L"Ytm32Auth"; RegisterClassEx(&authClass);
     WNDCLASSEX wc{sizeof(wc)}; wc.lpfnWndProc=windowProc; wc.hInstance=instance; wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName=L"Ytm32Main"; RegisterClassEx(&wc);
-    g_window=CreateWindowEx(0,wc.lpszClassName,L"Ytm32 — YouTube Music",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,650,590,nullptr,nullptr,instance,nullptr);
+    g_window=CreateWindowEx(0,wc.lpszClassName,L"Ytm32 — YouTube Music",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,1040,740,nullptr,nullptr,instance,nullptr);
     if(g_window&& ytm::hasOAuthSession())SetWindowText(g_loginButton,L"Android VR listo");
     else if(g_window&& ytm::hasSession())SetWindowText(g_loginButton,L"Cookies listas");
     ShowWindow(g_window,show); UpdateWindow(g_window);
