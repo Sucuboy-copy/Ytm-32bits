@@ -64,6 +64,36 @@ std::string searchInnerTube(const std::wstring& query, std::string& log, const s
     WinHttpCloseHandle(session);
     return response;
 }
+std::vector<unsigned char> downloadThumbnail(const std::wstring& url){
+    if(url.empty()||url.size()>8192)return {};
+    URL_COMPONENTS parts{};parts.dwStructSize=sizeof(parts);parts.dwSchemeLength=(DWORD)-1;parts.dwHostNameLength=(DWORD)-1;parts.dwUrlPathLength=(DWORD)-1;parts.dwExtraInfoLength=(DWORD)-1;
+    if(!WinHttpCrackUrl(url.c_str(),0,0,&parts)||parts.nScheme!=INTERNET_SCHEME_HTTPS||!parts.dwHostNameLength)return {};
+    std::wstring host(parts.lpszHostName,parts.dwHostNameLength),path(parts.lpszUrlPath,parts.dwUrlPathLength);
+    if(parts.dwExtraInfoLength)path.append(parts.lpszExtraInfo,parts.dwExtraInfoLength);
+    if(path.empty())path=L"/";
+    HINTERNET session=WinHttpOpen(L"Ytm32/0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+    if(!session)return {};
+    WinHttpSetTimeouts(session,3000,3000,6000,6000);
+    HINTERNET conn=WinHttpConnect(session,host.c_str(),parts.nPort,0);
+    HINTERNET req=conn?WinHttpOpenRequest(conn,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE):nullptr;
+    std::vector<unsigned char> bytes;
+    if(req){
+        const wchar_t* headers=L"Accept: image/jpeg,image/png,*/*;q=0.5\r\n";
+        BOOL ok=WinHttpSendRequest(req,headers,(DWORD)-1,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(req,nullptr);
+        DWORD status=0,statusSize=sizeof(status);
+        if(ok)ok=WinHttpQueryHeaders(req,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&statusSize,WINHTTP_NO_HEADER_INDEX)&&status==200;
+        if(ok){
+            DWORD available=0;
+            while(WinHttpQueryDataAvailable(req,&available)&&available){
+                if(bytes.size()+available>2*1024*1024){bytes.clear();break;}
+                size_t old=bytes.size();bytes.resize(old+available);DWORD got=0;
+                if(!WinHttpReadData(req,&bytes[old],available,&got)){bytes.clear();break;}
+                bytes.resize(old+got);if(!got)break;
+            }
+        }
+    }
+    if(req)WinHttpCloseHandle(req);if(conn)WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return bytes;
+}
 std::string fetchVisitorData(std::string& log){
     HINTERNET session=WinHttpOpen(L"Ytm32/0.1 (Windows NT)",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
     if(!session){log+="VisitorData WinHttpOpen failed: "+std::to_string(GetLastError())+"\r\n";return {};}

@@ -16,7 +16,7 @@ add_executable(Ytm32 WIN32 src/main.cpp src/json.cpp src/innertube.cpp src/sessi
 target_include_directories(Ytm32 PRIVATE include)
 target_compile_features(Ytm32 PRIVATE cxx_std_14)
 target_compile_definitions(Ytm32 PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0603 _WIN32_WINNT=0x0603)
-target_link_libraries(Ytm32 PRIVATE opus winhttp comctl32 comdlg32 mfplat mfuuid ole32 oleaut32 urlmon shlwapi crypt32 advapi32 shell32)
+target_link_libraries(Ytm32 PRIVATE opus winhttp comctl32 comdlg32 mfplat mfuuid ole32 oleaut32 urlmon shlwapi crypt32 advapi32 shell32 windowscodecs)
 if(MSVC)
   target_compile_options(Ytm32 PRIVATE /W4 /O2 /EHsc)
   set_property(TARGET Ytm32 PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

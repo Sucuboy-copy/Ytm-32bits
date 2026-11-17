@@ -9,6 +9,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
+#include <wincodec.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -17,6 +18,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <map>
+#include <atomic>
+#include <cmath>
 #include "ytm/json.hpp"
 #include "ytm/innertube.hpp"
 #include "ytm/session.hpp"
@@ -37,6 +41,8 @@ constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
 constexpr UINT WM_PLAYBACK_READY = WM_APP + 2, WM_MEDIA_ENGINE_EVENT = WM_APP + 3;
 constexpr UINT WM_OAUTH_BEGIN_DONE = WM_APP + 4, WM_OAUTH_POLL_DONE = WM_APP + 5;
 constexpr UINT WM_OPUS_DECODE_DONE = WM_APP + 6;
+constexpr UINT WM_THUMBNAIL_READY = WM_APP + 7;
+constexpr UINT ID_TIMER_PLAYBACK = 2;
 constexpr int ID_QUERY = 101, ID_SEARCH = 102, ID_RESULTS = 103, ID_STATUS = 104, ID_LOG = 105, ID_PLAY = 106, ID_PAUSE = 107, ID_LOGIN = 108;
 constexpr int ID_HOME = 109, ID_BROWSE = 110, ID_LIBRARY = 111, ID_FAVORITE = 112, ID_PREVIOUS = 113, ID_NEXT = 114, ID_OPEN_LOCAL = 115;
 constexpr int ID_QUICK_BASE = 120;
@@ -66,6 +72,13 @@ LONG g_oauthPollBusy = 0;
 std::wstring g_oauthVerificationUrl;
 struct OAuthPayload { ytm::OAuthDeviceInfo info; };
 struct OpusDecodePayload { DWORD requestToken = 0; size_t formatIndex = 0; bool success = false; std::shared_ptr<std::vector<uint8_t>> wav = std::make_shared<std::vector<uint8_t>>(); std::string diagnostic; };
+struct ThumbnailPayload { std::string videoId; std::vector<unsigned char> bytes; };
+std::map<std::string,HBITMAP> g_thumbnailBitmaps;
+std::map<std::string,COLORREF> g_thumbnailAccent;
+std::set<std::string> g_thumbnailPending;
+std::string g_currentVideoId;
+double g_playbackPosition=0.0,g_playbackDuration=0.0;
+COLORREF g_currentAccent=ACCENT;
 bool g_mfStarted = false, g_comInitialized = false;
 bool g_isLocalPlayback = false;
 IMFMediaEngine* g_mediaEngine = nullptr;
@@ -74,6 +87,7 @@ MediaEngineCallback* g_mediaCallback = nullptr;
 void startPlayback(const YouTubeVideoResult& item);
 bool initializeMediaPlayer();
 void addLog(const std::wstring& line);
+void requestThumbnails(const std::vector<YouTubeVideoResult>& rows);
 
 std::wstring favoritesPath() {
     wchar_t base[MAX_PATH]{};
@@ -90,7 +104,7 @@ std::string utf8Bytes(const std::wstring& value) {
 void saveFavorites() {
     const std::wstring path = favoritesPath(); if (path.empty()) return;
     std::string data;
-    for (const auto& item : g_favorites) data += item.videoId + "\t" + utf8Bytes(item.display) + "\n";
+    for (const auto& item : g_favorites) data += item.videoId + "\t" + utf8Bytes(item.display) + "\t" + utf8Bytes(item.thumbnailUrl) + "\n";
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) { DWORD written = 0; WriteFile(file, data.data(), (DWORD)data.size(), &written, nullptr); CloseHandle(file); }
 }
@@ -105,9 +119,11 @@ void loadFavorites() {
         size_t end = data.find('\n', at); if (end == std::string::npos) end = data.size();
         std::string line = data.substr(at, end - at); at = end + 1;
         size_t tab = line.find('\t'); if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) continue;
-        std::string id = line.substr(0, tab); std::wstring title = utf8(line.substr(tab + 1));
+        size_t secondTab=line.find('\t',tab+1);
+        std::string id = line.substr(0, tab); std::wstring title = utf8(line.substr(tab + 1,secondTab==std::string::npos?std::string::npos:secondTab-tab-1));
+        std::wstring thumbnail=secondTab==std::string::npos?L"":utf8(line.substr(secondTab+1));
         if (title.empty()) continue;
-        g_favorites.push_back({std::move(title), std::move(id)});
+        g_favorites.push_back({std::move(title), std::move(id),std::move(thumbnail)});
     }
 }
 const std::vector<YouTubeVideoResult>& visibleRows() { return g_view == 2 ? g_favorites : g_searchResults; }
@@ -118,6 +134,7 @@ void refreshRows() {
     for (const auto& row : rows) SendMessage(g_results, LB_ADDSTRING, 0, (LPARAM)row.display.c_str());
     ShowWindow(g_results, g_view == 2 || (g_view == 1 && !rows.empty()) ? SW_SHOW : SW_HIDE);
     EnableWindow(g_favoriteButton, g_view != 0 && SendMessage(g_results, LB_GETCOUNT, 0, 0) > 0);
+    InvalidateRect(g_results,nullptr,FALSE);
     if(g_window)InvalidateRect(g_window, nullptr, FALSE);
 }
 void setView(int view) {
@@ -133,6 +150,7 @@ void setView(int view) {
     else if (view == 0) SetWindowText(g_status, L"Inicio · descubre algo para escuchar");
     else if (g_searchResults.empty()) SetWindowText(g_status, L"Busca canciones, artistas o álbumes");
     refreshRows();
+    if(view==2)requestThumbnails(g_favorites);
 }
 void toggleFavorite(const YouTubeVideoResult& item) {
     const YouTubeVideoResult savedItem=item;
@@ -161,7 +179,39 @@ void openLocalAudio() {
     if(FAILED(hr)){SetWindowText(g_status,L"No se pudo abrir el archivo seleccionado.");return;}
     BSTR source=SysAllocString(fileUrl);hr=source?g_mediaEngine->SetSource(source):E_OUTOFMEMORY;if(source)SysFreeString(source);if(SUCCEEDED(hr))hr=g_mediaEngine->Play();
     if(FAILED(hr)){SetWindowText(g_status,L"Windows no pudo reproducir este formato de audio.");addLog(L"Falló la reproducción del archivo local.");return;}
-    g_isLocalPlayback=true;g_activeFormats.clear();g_queue.clear();g_nowPlaying=PathFindFileNameW(path);EnableWindow(g_playButton,TRUE);EnableWindow(g_previousButton,FALSE);EnableWindow(g_nextButton,FALSE);EnableWindow(g_pauseButton,TRUE);SetWindowText(g_status,L"Reproduciendo archivo local");InvalidateRect(g_window,nullptr,FALSE);addLog(L"Reproducción local: "+g_nowPlaying);
+    g_isLocalPlayback=true;g_activeFormats.clear();g_queue.clear();g_currentVideoId.clear();g_currentAccent=ACCENT;g_playbackPosition=0;g_playbackDuration=0;g_nowPlaying=PathFindFileNameW(path);EnableWindow(g_playButton,TRUE);EnableWindow(g_previousButton,FALSE);EnableWindow(g_nextButton,FALSE);EnableWindow(g_pauseButton,TRUE);SetWindowText(g_status,L"Reproduciendo archivo local");InvalidateRect(g_window,nullptr,FALSE);addLog(L"Reproducción local: "+g_nowPlaying);
+}
+
+HBITMAP decodeThumbnailBitmap(const std::vector<unsigned char>& bytes,COLORREF& accent){
+    if(bytes.empty()||bytes.size()>2*1024*1024)return nullptr;
+    IWICImagingFactory* factory=nullptr;IWICStream* stream=nullptr;IWICBitmapDecoder* decoder=nullptr;IWICBitmapFrameDecode* frame=nullptr;IWICBitmapScaler* scaler=nullptr;IWICFormatConverter* converter=nullptr;
+    HBITMAP bitmap=nullptr;
+    HRESULT hr=CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&factory));
+    if(SUCCEEDED(hr))hr=factory->CreateStream(&stream);
+    if(SUCCEEDED(hr))hr=stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()),(DWORD)bytes.size());
+    if(SUCCEEDED(hr))hr=factory->CreateDecoderFromStream(stream,nullptr,WICDecodeMetadataCacheOnLoad,&decoder);
+    if(SUCCEEDED(hr))hr=decoder->GetFrame(0,&frame);
+    if(SUCCEEDED(hr))hr=factory->CreateBitmapScaler(&scaler);
+    if(SUCCEEDED(hr))hr=scaler->Initialize(frame,96,96,WICBitmapInterpolationModeFant);
+    if(SUCCEEDED(hr))hr=factory->CreateFormatConverter(&converter);
+    if(SUCCEEDED(hr))hr=converter->Initialize(scaler,GUID_WICPixelFormat32bppBGR,WICBitmapDitherTypeNone,nullptr,0.0,WICBitmapPaletteTypeCustom);
+    if(SUCCEEDED(hr)){
+        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=96;info.bmiHeader.biHeight=-96;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+        void* pixels=nullptr;bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+        if(!bitmap||FAILED(converter->CopyPixels(nullptr,96*4,96*96*4,(BYTE*)pixels))){if(bitmap)DeleteObject(bitmap);bitmap=nullptr;}
+        else{
+            const BYTE* p=(const BYTE*)pixels;unsigned long long red=0,green=0,blue=0;for(size_t i=0;i<96u*96u;++i){blue+=p[i*4];green+=p[i*4+1];red+=p[i*4+2];}
+            accent=RGB((BYTE)((red/(96*96)+255)/2),(BYTE)((green/(96*96)+255)/2),(BYTE)((blue/(96*96)+255)/2));
+        }
+    }
+    if(converter)converter->Release();if(scaler)scaler->Release();if(frame)frame->Release();if(decoder)decoder->Release();if(stream)stream->Release();if(factory)factory->Release();return bitmap;
+}
+void requestThumbnails(const std::vector<YouTubeVideoResult>& rows){
+    auto requests=std::make_shared<std::vector<std::pair<std::string,std::wstring>>>();
+    for(const auto& row:rows){if(row.thumbnailUrl.empty()||g_thumbnailBitmaps.find(row.videoId)!=g_thumbnailBitmaps.end()||!g_thumbnailPending.insert(row.videoId).second)continue;requests->push_back({row.videoId,row.thumbnailUrl});if(requests->size()>=32)break;}
+    if(requests->empty())return;
+    auto cursor=std::make_shared<std::atomic<size_t>>(0);const size_t workers=std::min<size_t>(4,requests->size());
+    for(size_t i=0;i<workers;++i)std::thread([requests,cursor]{for(;;){const size_t at=(*cursor)++;if(at>=requests->size())break;auto* payload=new(std::nothrow) ThumbnailPayload();if(!payload)continue;payload->videoId=(*requests)[at].first;payload->bytes=downloadThumbnail((*requests)[at].second);if(!PostMessage(g_window,WM_THUMBNAIL_READY,0,(LPARAM)payload))delete payload;}}).detach();
 }
 
 void refreshLog() {
@@ -252,7 +302,7 @@ void loadFormat(size_t index){
     SetWindowText(g_status,(L"Cargando audio itag "+std::to_wstring(g_activeFormats[index].itag)+L"…").c_str());
 }
 void startPlayback(const YouTubeVideoResult& item){
-    g_isLocalPlayback=false;g_nowPlaying=item.display;EnableWindow(g_playButton,TRUE);InvalidateRect(g_window,nullptr,FALSE);
+    g_isLocalPlayback=false;g_nowPlaying=item.display;g_currentVideoId=item.videoId;g_currentAccent=ACCENT;auto cover=g_thumbnailBitmaps.find(item.videoId);if(cover!=g_thumbnailBitmaps.end())g_currentAccent=g_thumbnailAccent[item.videoId];g_playbackPosition=0;g_playbackDuration=0;EnableWindow(g_playButton,TRUE);InvalidateRect(g_window,nullptr,FALSE);
     SetWindowText(g_status,(L"Resolviendo: "+item.display).c_str());
     addLog(L"Resolviendo reproducción: "+item.display);
     const std::string videoId=item.videoId;const std::wstring title=item.display;const DWORD requestToken=++g_playRequestToken;const std::string visitorData=g_searchVisitorData;
@@ -372,10 +422,18 @@ void paint(HWND h) {
     }
     RECT player{176,r.bottom-94,r.right,r.bottom};HBRUSH pb=CreateSolidBrush(SURFACE);FillRect(dc,&player,pb);DeleteObject(pb);
     HPEN ppen=CreatePen(PS_SOLID,1,RGB(50,52,62));oldPen=SelectObject(dc,ppen);MoveToEx(dc,176,r.bottom-94,nullptr);LineTo(dc,r.right,r.bottom-94);SelectObject(dc,oldPen);DeleteObject(ppen);
-    RECT art{196,r.bottom-77,246,r.bottom-27};HBRUSH ab=CreateSolidBrush(SOFT_ACCENT);FillRect(dc,&art,ab);DeleteObject(ab);
-    SetTextColor(dc,ACCENT);RECT note=art;DrawText(dc,L"♪",-1,&note,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    SetTextColor(dc,TEXT);RECT track{258,r.bottom-72,520,r.bottom-48};DrawText(dc,g_nowPlaying.empty()?L"Elige algo para reproducir":g_nowPlaying.c_str(),-1,&track,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-    SetTextColor(dc,MUTED);RECT artist{258,r.bottom-47,560,r.bottom-26};wchar_t statusText[256]{};GetWindowText(g_status,statusText,256);DrawText(dc,statusText[0]?statusText:L"YouTube Music · Reproductor ligero",-1,&artist,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    const int progressY=r.bottom-84,progressLeft=278,progressRight=std::max(progressLeft+40,r.right-224);
+    RECT progressTrack{progressLeft,progressY,progressRight,progressY+3};HBRUSH tr=CreateSolidBrush(RGB(67,69,78));FillRect(dc,&progressTrack,tr);DeleteObject(tr);
+    if(g_playbackDuration>0.0){double ratio=std::max(0.0,std::min(1.0,g_playbackPosition/g_playbackDuration));RECT filled=progressTrack;filled.right=progressLeft+(int)((progressRight-progressLeft)*ratio);HBRUSH fill=CreateSolidBrush(g_currentAccent);FillRect(dc,&filled,fill);DeleteObject(fill);}
+    auto clockText=[](double value){int sec=std::isfinite(value)&&value>0?(int)value:0;wchar_t text[16]{};wsprintf(text,L"%d:%02d",sec/60,sec%60);return std::wstring(text);};
+    SetTextColor(dc,MUTED);RECT elapsed{198,r.bottom-91,260,r.bottom-76};std::wstring elapsedText=clockText(g_playbackPosition);DrawText(dc,elapsedText.c_str(),-1,&elapsed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT duration{progressRight+8,r.bottom-91,r.right-190,r.bottom-76};std::wstring durationText=clockText(g_playbackDuration);DrawText(dc,durationText.c_str(),-1,&duration,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    RECT art{196,r.bottom-67,246,r.bottom-17};auto currentArt=g_thumbnailBitmaps.find(g_currentVideoId);
+    if(currentArt!=g_thumbnailBitmaps.end()){HDC mem=CreateCompatibleDC(dc);HGDIOBJ old=SelectObject(mem,currentArt->second);StretchBlt(dc,art.left,art.top,art.right-art.left,art.bottom-art.top,mem,0,0,96,96,SRCCOPY);SelectObject(mem,old);DeleteDC(mem);}
+    else{HBRUSH ab=CreateSolidBrush(SOFT_ACCENT);FillRect(dc,&art,ab);DeleteObject(ab);SetTextColor(dc,g_currentAccent);RECT note=art;DrawText(dc,L"♪",-1,&note,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
+    const int metadataRight=std::max(340,176+(r.right-176)/2-120);
+    SetTextColor(dc,TEXT);RECT track{258,r.bottom-62,metadataRight,r.bottom-39};DrawText(dc,g_nowPlaying.empty()?L"Elige algo para reproducir":g_nowPlaying.c_str(),-1,&track,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    SetTextColor(dc,MUTED);RECT artist{258,r.bottom-39,metadataRight,r.bottom-19};wchar_t statusText[256]{};GetWindowText(g_status,statusText,256);DrawText(dc,statusText[0]?statusText:L"YouTube Music · Reproductor ligero",-1,&artist,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
     EndPaint(h, &ps);
 }
 LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -407,6 +465,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         for(HWND c:g_quickButtons)SendMessage(c,WM_SETFONT,(WPARAM)g_font,TRUE);
         SetWindowLongPtr(g_query,GWLP_USERDATA,GetWindowLongPtr(g_query,GWLP_WNDPROC)); SetWindowLongPtr(g_query,GWLP_WNDPROC,(LONG_PTR)EditProc);
         loadFavorites(); setView(0);
+        SetTimer(h,ID_TIMER_PLAYBACK,500,nullptr);
         return 0;
     }
     case WM_COMMAND:
@@ -437,6 +496,18 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (LOWORD(w)==ID_RESULTS&&HIWORD(w)==LBN_DBLCLK) { playVisibleIndex((int)SendMessage(g_results,LB_GETCURSEL,0,0));return 0; }
         break;
+    case WM_TIMER:
+        if(w==ID_TIMER_PLAYBACK&&g_mediaEngine){double position=g_mediaEngine->GetCurrentTime(),duration=g_mediaEngine->GetDuration();if(std::isfinite(position)&&position>=0)g_playbackPosition=position;if(std::isfinite(duration)&&duration>0)g_playbackDuration=duration;InvalidateRect(h,nullptr,FALSE);return 0;}break;
+    case WM_LBUTTONDOWN: {
+        const int x=LOWORD(l),y=HIWORD(l);
+        RECT client{};GetClientRect(h,&client);const int playerTop=client.bottom-94,left=278,right=std::max(left+40,client.right-224);
+        if(y>=playerTop&&y<=playerTop+18&&x>=left&&x<=right&&g_mediaEngine&&g_playbackDuration>0){double target=g_playbackDuration*(double)(x-left)/(double)(right-left);if(SUCCEEDED(g_mediaEngine->SetCurrentTime(target))){g_playbackPosition=target;InvalidateRect(h,nullptr,FALSE);}return 0;}break;
+    }
+    case WM_THUMBNAIL_READY: {
+        std::unique_ptr<ThumbnailPayload> payload((ThumbnailPayload*)l);g_thumbnailPending.erase(payload->videoId);
+        if(!payload->bytes.empty()){COLORREF accent=ACCENT;HBITMAP bitmap=decodeThumbnailBitmap(payload->bytes,accent);if(bitmap){auto old=g_thumbnailBitmaps.find(payload->videoId);if(old!=g_thumbnailBitmaps.end())DeleteObject(old->second);g_thumbnailBitmaps[payload->videoId]=bitmap;g_thumbnailAccent[payload->videoId]=accent;if(payload->videoId==g_currentVideoId)g_currentAccent=accent;InvalidateRect(g_results,nullptr,FALSE);InvalidateRect(h,nullptr,FALSE);}}
+        return 0;
+    }
     case WM_SEARCH_DONE: {
         std::unique_ptr<SearchResultPayload> p(reinterpret_cast<SearchResultPayload*>(l));
         g_searchVisitorData=p->visitorData;
@@ -452,6 +523,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             rows = parseVideoSearchResults(p->body,jsonParsed);
             g_searchResults=rows;
             refreshRows();
+            requestThumbnails(rows);
             std::wstring status = !jsonParsed ? L"La respuesta no contiene JSON válido. Abre Registro." : rows.empty() ? L"YouTube respondió, pero no se encontraron videos." : std::to_wstring(rows.size())+L" videos · selecciona uno y pulsa Reproducir.";
             SetWindowText(g_status,status.c_str());
             details += L"\r\nParser recognized rows: " + std::to_wstring(rows.size()) + L"\r\n";
@@ -510,6 +582,12 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,(d->CtlID==ID_HOME&&g_view==0||d->CtlID==ID_BROWSE&&g_view==1||d->CtlID==ID_LIBRARY&&g_view==2)?RGB(255,190,198):TEXT);SelectObject(d->hDC,g_font);
         if(d->CtlType==ODT_LISTBOX&&d->itemID!=UINT(-1)){
             wchar_t buf[512]{};SendMessage(d->hwndItem,LB_GETTEXT,d->itemID,(LPARAM)buf);RECT row=d->rcItem;row.left+=16;row.right-=12;
+            const auto& rows=visibleRows();if(d->itemID<rows.size()){
+                auto thumb=g_thumbnailBitmaps.find(rows[d->itemID].videoId);RECT cover{row.left-8,row.top+5,row.left+42,row.top+55};
+                if(thumb!=g_thumbnailBitmaps.end()){HDC mem=CreateCompatibleDC(d->hDC);HGDIOBJ old=SelectObject(mem,thumb->second);StretchBlt(d->hDC,cover.left,cover.top,50,50,mem,0,0,96,96,SRCCOPY);SelectObject(mem,old);DeleteDC(mem);}
+                else{HBRUSH placeholder=CreateSolidBrush(SOFT_ACCENT);FillRect(d->hDC,&cover,placeholder);DeleteObject(placeholder);SetTextColor(d->hDC,ACCENT);DrawText(d->hDC,L"♪",-1,&cover,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
+                row.left+=58;
+            }
             std::wstring line=buf;size_t split=line.find(L"  —  ");std::wstring title=split==std::wstring::npos?line:line.substr(0,split);std::wstring artist=split==std::wstring::npos?L"YouTube Music":line.substr(split+5);
             SetTextColor(d->hDC,TEXT);RECT primary=row;primary.top+=5;primary.bottom=row.top+31;DrawText(d->hDC,title.c_str(),-1,&primary,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
             SetTextColor(d->hDC,MUTED);RECT secondary=row;secondary.top+=30;DrawText(d->hDC,artist.c_str(),-1,&secondary,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
@@ -541,6 +619,8 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_GETMINMAXINFO: { auto* info=(MINMAXINFO*)l;info->ptMinTrackSize.x=780;info->ptMinTrackSize.y=560;return 0; }
     case WM_DESTROY:
+        KillTimer(h,ID_TIMER_PLAYBACK);
+        for(const auto& item:g_thumbnailBitmaps)DeleteObject(item.second);g_thumbnailBitmaps.clear();g_thumbnailAccent.clear();
         if(g_mediaEngine){g_mediaEngine->Shutdown();g_mediaEngine->Release();g_mediaEngine=nullptr;}
         if(g_mediaCallback){g_mediaCallback->Release();g_mediaCallback=nullptr;}
         if(g_mfStarted){MFShutdown();g_mfStarted=false;}

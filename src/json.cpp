@@ -41,6 +41,22 @@ std::string videoIdFrom(const JsonValue& item){
     if(const auto* p=member(item,"navigationEndpoint"))if(const auto* w=member(*p,"watchEndpoint"))if(const auto* id=member(*w,"videoId"))return id->scalar;
     return {};
 }
+std::string thumbnailUrlFrom(const JsonValue& item){
+    const JsonValue* thumbnail=member(item,"thumbnail");
+    if(thumbnail){
+        const JsonValue* renderer=member(*thumbnail,"musicThumbnailRenderer");if(!renderer)renderer=member(*thumbnail,"croppedSquareThumbnailRenderer");
+        if(renderer)thumbnail=member(*renderer,"thumbnail");
+    }
+    if(!thumbnail)if(const auto* renderer=member(item,"thumbnailRenderer")){
+        thumbnail=member(*renderer,"musicThumbnailRenderer");if(thumbnail)thumbnail=member(*thumbnail,"thumbnail");
+        if(!thumbnail){thumbnail=member(*renderer,"croppedSquareThumbnailRenderer");if(thumbnail)thumbnail=member(*thumbnail,"thumbnail");}
+    }
+    const auto* images=thumbnail?member(*thumbnail,"thumbnails"):nullptr;
+    if(!images||images->kind!=JsonValue::Kind::Array)return {};
+    std::string best;
+    for(const auto& image:images->array)if(const auto* url=member(image,"url"))if(url->kind==JsonValue::Kind::Scalar&&!url->scalar.empty())best=url->scalar;
+    return best;
+}
 void extractVideoItems(const JsonValue& node,std::vector<YouTubeVideoResult>& rows){
     if(node.kind==JsonValue::Kind::Object){
         for(const auto& field:node.object){
@@ -56,7 +72,8 @@ void extractVideoItems(const JsonValue& node,std::vector<YouTubeVideoResult>& ro
                 std::wstring line=utf8(title);if(!subtitle.empty())line+=L"  —  "+utf8(subtitle);
                 if(line.size()>180)line.resize(180);
                 auto duplicate=std::find_if(rows.begin(),rows.end(),[&](const YouTubeVideoResult& r){return r.videoId==videoId;});
-                if(duplicate==rows.end()&&rows.size()<80)rows.push_back({std::move(line),videoId});
+                const std::string thumbnail=thumbnailUrlFrom(field.second);
+                if(duplicate==rows.end()&&rows.size()<80)rows.push_back({std::move(line),videoId,utf8(thumbnail)});
                 continue;
             }
             const bool videoRenderer=field.first=="videoRenderer"||field.first=="compactVideoRenderer"||field.first=="videoWithContextRenderer"||field.first=="playlistVideoRenderer";
@@ -72,7 +89,8 @@ void extractVideoItems(const JsonValue& node,std::vector<YouTubeVideoResult>& ro
                 std::wstring line=utf8(title);if(!subtitle.empty())line+=L"  —  "+utf8(subtitle);
                 if(line.size()>180)line.resize(180);
                 auto duplicate=std::find_if(rows.begin(),rows.end(),[&](const YouTubeVideoResult& r){return r.videoId==videoId;});
-                if(duplicate==rows.end()&&rows.size()<80)rows.push_back({std::move(line),videoId});
+                const std::string thumbnail=thumbnailUrlFrom(field.second);
+                if(duplicate==rows.end()&&rows.size()<80)rows.push_back({std::move(line),videoId,utf8(thumbnail)});
             }else extractVideoItems(field.second,rows);
         }
     }else if(node.kind==JsonValue::Kind::Array){for(const auto& item:node.array)extractVideoItems(item,rows);}

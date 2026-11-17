@@ -7,4 +7,5 @@
 namespace ytm {
 std::string searchInnerTube(const std::wstring& query, std::string& log, const std::string& visitorData = {});
 std::vector<AudioFormat> resolveAudio(const std::string& videoId, std::string visitorData, std::string& log, bool& loginRequired);
+std::vector<unsigned char> downloadThumbnail(const std::wstring& url);
 }
