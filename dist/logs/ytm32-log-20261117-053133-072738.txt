@@ -1,0 +1,20 @@
+Player client: VISIONOS 1.02
+Session headers: attached (redacted)
+Player HTTP status: 400
+streamingData.adaptiveFormats: missing
+No direct URL for audio itag 251/140 in this response.
+Player client: ANDROID_VR 1.65.10
+Session headers: attached (redacted)
+Player HTTP status: 400
+streamingData.adaptiveFormats: missing
+No direct URL for audio itag 251/140 in this response.
+Player client: TVHTML5 7.20210224.00.00
+Session headers: attached (redacted)
+Player HTTP status: 200
+Playability: OK
+adaptiveFormats entries: 22
+Audio stream itag 140, mime=audio/mp4, direct URL=no, cipher=no
+Audio stream itag 249, mime=audio/webm, direct URL=no, cipher=no
+Audio stream itag 250, mime=audio/webm, direct URL=no, cipher=no
+Audio stream itag 251, mime=audio/webm, direct URL=no, cipher=no
+No direct URL for audio itag 251/140 in this response.

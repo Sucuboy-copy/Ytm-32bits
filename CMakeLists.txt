@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.15)
+project(Ytm32 LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "Ytm32 es una aplicación nativa para Windows.")
+endif()
+
+add_executable(Ytm32 WIN32 src/main.cpp src/json.cpp src/innertube.cpp src/session.cpp)
+target_include_directories(Ytm32 PRIVATE include)
+target_compile_features(Ytm32 PRIVATE cxx_std_14)
+target_compile_definitions(Ytm32 PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0603 _WIN32_WINNT=0x0603)
+target_link_libraries(Ytm32 PRIVATE winhttp comctl32 comdlg32 mfplat mfuuid ole32 oleaut32 crypt32 advapi32 shell32)
+if(MSVC)
+  target_compile_options(Ytm32 PRIVATE /W4 /O2 /EHsc)
+  set_property(TARGET Ytm32 PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+elseif(MINGW)
+  target_link_options(Ytm32 PRIVATE -municode -static -static-libgcc -static-libstdc++)
+endif()

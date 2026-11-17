@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ytm32 · guardar registro</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 "Segoe UI", Arial, sans-serif; background:#111319; color:#eef0f5; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; }
+    main { width:min(900px,100%); background:#191c24; border:1px solid #303441; border-radius:14px; padding:26px; box-shadow:0 18px 60px #0006; }
+    h1 { margin:0 0 6px; font-size:24px; }
+    p { color:#aab0bf; margin:0 0 18px; }
+    textarea { display:block; width:100%; height:min(55vh,480px); min-height:240px; resize:vertical; padding:14px; border:1px solid #3a4050; border-radius:9px; background:#101218; color:#eef0f5; font:13px/1.5 Consolas,"Courier New",monospace; outline:none; }
+    textarea:focus { border-color:#ff4b5d; box-shadow:0 0 0 2px #ff4b5d33; }
+    .row { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    button { border:1px solid #424858; border-radius:8px; padding:10px 15px; background:#252a35; color:#eef0f5; font:600 14px "Segoe UI",Arial,sans-serif; cursor:pointer; }
+    button:hover { background:#343b49; }
+    button.primary { background:#d9364a; border-color:#d9364a; }
+    button.primary:hover { background:#ed465a; }
+    #count { margin-left:auto; color:#aab0bf; font-size:13px; }
+    #notice { min-height:24px; margin:12px 0 0; color:#ffb6be; font-size:14px; }
+    .privacy { margin-top:12px; font-size:13px; }
+    @media(max-width:560px) { main { padding:18px; } #count { width:100%; margin-left:0; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Guardar registro de Ytm32</h1>
+    <p>Pega el registro con <b>Ctrl+V</b> en el recuadro y guárdalo como archivo de texto.</p>
+    <textarea id="log" placeholder="Haz clic aquí y pulsa Ctrl+V…" spellcheck="false" autofocus></textarea>
+    <div class="row">
+      <button class="primary" id="save">Subir y guardar</button>
+      <button id="download">Descargar .txt</button>
+      <button id="copy">Copiar</button>
+      <button id="clear">Limpiar</button>
+      <span id="count">0 caracteres</span>
+    </div>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <p class="privacy">“Subir y guardar” envía el texto a este servidor local y lo guarda en <code>dist/logs</code>. No se envía a un servicio externo.</p>
+  </main>
+  <script>
+    (() => {
+      const input = document.getElementById('log');
+      const count = document.getElementById('count');
+      const notice = document.getElementById('notice');
+      const update = () => { count.textContent = `${input.value.length.toLocaleString('es-ES')} caracteres`; };
+      input.addEventListener('input', update);
+      input.addEventListener('paste', () => setTimeout(update, 0));
+      document.getElementById('save').addEventListener('click', async (event) => {
+        const text = input.value;
+        if (!text.trim()) { notice.textContent = 'Pega un registro antes de guardarlo.'; input.focus(); return; }
+        const button = event.currentTarget;
+        button.disabled = true;
+        notice.textContent = 'Subiendo al servidor local…';
+        try {
+          const response = await fetch('/upload', {method:'POST', headers:{'Content-Type':'text/plain;charset=UTF-8'}, body:text});
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+          notice.textContent = `Guardado en logs/${result.file}`;
+        } catch (error) {
+          notice.textContent = `No se pudo subir: ${error.message}. Comprueba que el servidor local esté activo.`;
+        } finally { button.disabled = false; }
+      });
+      document.getElementById('download').addEventListener('click', () => {
+        const text = input.value;
+        if (!text.trim()) { notice.textContent = 'Pega un registro antes de descargarlo.'; input.focus(); return; }
+        const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        link.href = url; link.download = `ytm32-log-${stamp}.txt`;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        notice.textContent = 'Descarga iniciada.';
+      });
+      document.getElementById('copy').addEventListener('click', async () => {
+        if (!input.value) { notice.textContent = 'No hay texto para copiar.'; return; }
+        try { await navigator.clipboard.writeText(input.value); notice.textContent = 'Registro copiado.'; }
+        catch (_) { input.focus(); input.select(); notice.textContent = 'Pulsa Ctrl+C para copiar el texto seleccionado.'; }
+      });
+      document.getElementById('clear').addEventListener('click', () => {
+        input.value = ''; update(); notice.textContent = 'Recuadro limpiado.'; input.focus();
+      });
+      update();
+    })();
+  </script>
+</body>
+</html>
