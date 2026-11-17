@@ -1,0 +1,45 @@
+name: Compilar
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar MinGW-w64 (x86)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-i686 cmake ninja-build
+
+      - name: Configurar
+        run: cmake -S . -B build-ci -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw32.cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compilar
+        run: cmake --build build-ci --parallel
+
+      - name: Comprobar el ejecutable
+        run: |
+          file build-ci/Ytm32.exe
+          ls -l build-ci/Ytm32.exe
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ytm32-x86
+          path: build-ci/Ytm32.exe
+          if-no-files-found: error
+
+      - name: Publicar release (solo tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build-ci/Ytm32.exe --title "$GITHUB_REF_NAME" --generate-notes
