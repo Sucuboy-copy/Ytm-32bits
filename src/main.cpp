@@ -7,6 +7,7 @@
 #include <commdlg.h>
 #include <shlwapi.h>
 #include <mfapi.h>
+#include <mfidl.h>
 #include <mfmediaengine.h>
 #include <string>
 #include <vector>
@@ -21,8 +22,14 @@
 #include "ytm/session.hpp"
 #include "ytm/oauth.hpp"
 #include "ytm/opus_decoder.hpp"
+#include "ytm/memory_stream.hpp"
 
 #pragma comment(lib, "winhttp.lib")
+
+#ifdef __MINGW32__
+// Las cabeceras de MinGW-w64 no declaran esta función de mfplat.dll (sí existe en libmfplat.a).
+extern "C" HRESULT WINAPI MFCreateMFByteStreamOnStream(IStream* stream, IMFByteStream** byteStream);
+#endif
 
 namespace {
 using namespace ytm;
@@ -49,8 +56,7 @@ DWORD g_playRequestToken = 0;
 LONG g_oauthPollBusy = 0;
 std::wstring g_oauthVerificationUrl;
 struct OAuthPayload { ytm::OAuthDeviceInfo info; };
-struct OpusDecodePayload { DWORD requestToken = 0; size_t formatIndex = 0; bool success = false; std::wstring wavPath; std::string diagnostic; };
-std::vector<std::wstring> g_opusWavePaths;
+struct OpusDecodePayload { DWORD requestToken = 0; size_t formatIndex = 0; bool success = false; std::shared_ptr<std::vector<uint8_t>> wav = std::make_shared<std::vector<uint8_t>>(); std::string diagnostic; };
 bool g_mfStarted = false, g_comInitialized = false;
 IMFMediaEngine* g_mediaEngine = nullptr;
 class MediaEngineCallback;
@@ -109,13 +115,29 @@ bool initializeMediaPlayer(){
     if(FAILED(hr)){addLog(L"No se pudo iniciar Media Engine. HRESULT: "+std::to_wstring((unsigned long)hr));g_mediaCallback->Release();g_mediaCallback=nullptr;MFShutdown();g_mfStarted=false;return false;}
     return true;
 }
+HRESULT playPcmFromMemory(const std::shared_ptr<std::vector<uint8_t>>& wav){
+    if(!g_mediaEngine||!wav||wav->empty())return E_UNEXPECTED;
+    static const GUID mediaEngineExIid={0x83015ead,0xb1e6,0x40d0,{0xa9,0x8a,0x37,0x14,0x5f,0xfe,0x1a,0xd1}};
+    static const GUID byteStreamContentType={0xfc358289,0x3cb6,0x460c,{0xa4,0x24,0xb6,0x68,0x12,0x60,0x37,0x5a}};
+    static const GUID byteStreamOriginName={0xfc358288,0x3cb6,0x460c,{0xa4,0x24,0xb6,0x68,0x12,0x60,0x37,0x5a}};
+    IStream* stream=new(std::nothrow) SharedMemoryStream(wav);if(!stream)return E_OUTOFMEMORY;
+    IMFByteStream* byteStream=nullptr;HRESULT hr=MFCreateMFByteStreamOnStream(stream,&byteStream);stream->Release();
+    if(FAILED(hr))return hr;
+    IMFAttributes* attributes=nullptr;
+    if(SUCCEEDED(byteStream->QueryInterface(IID_PPV_ARGS(&attributes)))){attributes->SetString(byteStreamContentType,L"audio/wav");attributes->SetString(byteStreamOriginName,L"ytm-opus.wav");attributes->Release();}
+    IMFMediaEngineEx* engine=nullptr;hr=g_mediaEngine->QueryInterface(mediaEngineExIid,(void**)&engine);
+    if(SUCCEEDED(hr)){BSTR name=SysAllocString(L"ytm-opus.wav");hr=name?engine->SetSourceFromByteStream(byteStream,name):E_OUTOFMEMORY;if(name)SysFreeString(name);engine->Release();}
+    byteStream->Release();
+    if(SUCCEEDED(hr))hr=g_mediaEngine->Play();
+    return hr;
+}
 void loadFormat(size_t index){
     if(!g_mediaEngine||index>=g_activeFormats.size())return;
     g_activeFormat=index;
     if(g_activeFormats[index].itag==251){
         const DWORD requestToken=g_playRequestToken;const std::string url=g_activeFormats[index].url;
-        SetWindowText(g_status,L"Decodificando WebM/Opus…");addLog(L"Descargando y decodificando itag 251 con libopus.");
-        std::thread([requestToken,index,url]{auto* p=new OpusDecodePayload();p->requestToken=requestToken;p->formatIndex=index;p->success=decodeWebmOpusToWav(url,p->wavPath,p->diagnostic);if(!PostMessage(g_window,WM_OPUS_DECODE_DONE,0,(LPARAM)p)){if(!p->wavPath.empty())DeleteFileW(p->wavPath.c_str());delete p;}}).detach();return;
+        SetWindowText(g_status,L"Decodificando WebM/Opus…");addLog(L"Descargando y decodificando itag 251 con libopus (en memoria).");
+        std::thread([requestToken,index,url]{auto* p=new OpusDecodePayload();p->requestToken=requestToken;p->formatIndex=index;p->success=decodeWebmOpusToWav(url,*p->wav,p->diagnostic);if(!PostMessage(g_window,WM_OPUS_DECODE_DONE,0,(LPARAM)p))delete p;}).detach();return;
     }
     std::wstring url=utf8(g_activeFormats[index].url);
     BSTR source=SysAllocString(url.c_str());
@@ -293,13 +315,11 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_OPUS_DECODE_DONE: {
         std::unique_ptr<OpusDecodePayload> p(reinterpret_cast<OpusDecodePayload*>(l));
-        if(p->requestToken!=g_playRequestToken||p->formatIndex!=g_activeFormat){if(!p->wavPath.empty())DeleteFileW(p->wavPath.c_str());return 0;}
+        if(p->requestToken!=g_playRequestToken||p->formatIndex!=g_activeFormat)return 0;
         if(!p->success){addLog(L"No se pudo decodificar itag 251: "+utf8(p->diagnostic));if(g_activeFormat+1<g_activeFormats.size()){++g_activeFormat;addLog(L"Usando formato alternativo itag "+std::to_wstring(g_activeFormats[g_activeFormat].itag));loadFormat(g_activeFormat);}else SetWindowText(g_status,L"No se pudo decodificar el audio. Abre Registro.");return 0;}
-        wchar_t fileUrl[32768]{};DWORD capacity=(DWORD)(sizeof(fileUrl)/sizeof(fileUrl[0]));HRESULT hr=UrlCreateFromPathW(p->wavPath.c_str(),fileUrl,&capacity,0);
-        if(FAILED(hr)){DeleteFileW(p->wavPath.c_str());addLog(L"No se pudo convertir WAV a URL local. HRESULT: "+std::to_wstring((unsigned long)hr));SetWindowText(g_status,L"No se pudo abrir el audio convertido.");return 0;}
-        BSTR source=SysAllocString(fileUrl);hr=source?g_mediaEngine->SetSource(source):E_OUTOFMEMORY;if(source)SysFreeString(source);if(SUCCEEDED(hr))hr=g_mediaEngine->Play();
-        if(FAILED(hr)){DeleteFileW(p->wavPath.c_str());addLog(L"Media Engine no pudo abrir WAV. HRESULT: "+std::to_wstring((unsigned long)hr));SetWindowText(g_status,L"No se pudo abrir el audio convertido.");return 0;}
-        g_opusWavePaths.push_back(p->wavPath);addLog(L"Opus decodificado a WAV PCM temporal; reproduciendo itag 251.");SetWindowText(g_status,L"Cargando audio itag 251 (Opus)…");return 0;
+        const HRESULT hr=playPcmFromMemory(p->wav);
+        if(FAILED(hr)){addLog(L"Media Engine no pudo abrir el audio en memoria. HRESULT: "+std::to_wstring((unsigned long)hr));SetWindowText(g_status,L"No se pudo abrir el audio convertido.");return 0;}
+        addLog(L"Opus decodificado a WAV PCM en memoria ("+std::to_wstring(p->wav->size()/1024)+L" KiB); reproduciendo itag 251.");SetWindowText(g_status,L"Cargando audio itag 251 (Opus)…");return 0;
     }
     case WM_MEDIA_ENGINE_EVENT: {
         const DWORD event=(DWORD)w;
@@ -334,7 +354,6 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: { int width=LOWORD(l); MoveWindow(g_loginButton,width-152,29,120,30,TRUE); MoveWindow(g_query,32,112,width-180,36,TRUE); MoveWindow(g_search,width-140,112,108,36,TRUE); MoveWindow(g_results,32,180,width-64,HIWORD(l)-230,TRUE); MoveWindow(g_status,32,HIWORD(l)-38,width-392,24,TRUE); MoveWindow(g_playButton,width-360,HIWORD(l)-42,112,34,TRUE); MoveWindow(g_pauseButton,width-240,HIWORD(l)-42,92,34,TRUE); MoveWindow(g_logButton,width-140,HIWORD(l)-42,108,34,TRUE); return 0; }
     case WM_DESTROY:
         if(g_mediaEngine){g_mediaEngine->Shutdown();g_mediaEngine->Release();g_mediaEngine=nullptr;}
-        for(const auto& path:g_opusWavePaths)DeleteFileW(path.c_str());g_opusWavePaths.clear();
         if(g_mediaCallback){g_mediaCallback->Release();g_mediaCallback=nullptr;}
         if(g_mfStarted){MFShutdown();g_mfStarted=false;}
         if(g_comInitialized){CoUninitialize();g_comInitialized=false;}

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <vector>
 #include "ytm/opus_decoder.hpp"
 
@@ -24,6 +26,7 @@ bool element(const std::vector<uint8_t>& b,size_t& pos,size_t parentEnd,Element&
     e={(uint32_t)id,pos,(size_t)size,pos+(size_t)size,unknown};return true;
 }
 uint64_t uintElement(const std::vector<uint8_t>& b,const Element& e){uint64_t v=0;for(size_t i=e.data;i<e.end;++i)v=(v<<8)|b[i];return v;}
+double floatElement(const std::vector<uint8_t>& b,const Element& e){if(e.size==4){uint32_t v=0;for(size_t i=e.data;i<e.end;++i)v=(v<<8)|b[i];float f;std::memcpy(&f,&v,4);return f;}if(e.size==8){uint64_t v=0;for(size_t i=e.data;i<e.end;++i)v=(v<<8)|b[i];double d;std::memcpy(&d,&v,8);return d;}return 0;}
 std::string stringElement(const std::vector<uint8_t>& b,const Element& e){return std::string((const char*)&b[e.data],e.size);}
 struct OpusTrack { uint64_t number=0; unsigned channels=0; unsigned preSkip=0; bool found=false; };
 bool parseTrack(const std::vector<uint8_t>& b,const Element& entry,OpusTrack& selected){
@@ -34,11 +37,12 @@ bool parseTrack(const std::vector<uint8_t>& b,const Element& entry,OpusTrack& se
     const unsigned channels=privateData[9];const unsigned mapping=privateData[18];if((channels!=1&&channels!=2)||mapping!=0)return true;
     selected.number=number;selected.channels=channels;selected.preSkip=(unsigned)privateData[10]|((unsigned)privateData[11]<<8);selected.found=number!=0;return true;
 }
-bool writeAll(HANDLE file,const void* data,DWORD size){const BYTE* p=(const BYTE*)data;while(size){DWORD wrote=0;if(!WriteFile(file,p,size,&wrote,nullptr)||!wrote)return false;p+=wrote;size-=wrote;}return true;}
+constexpr uint64_t kMaxPcmBytes=256ull*1024*1024;
+bool appendBytes(std::vector<uint8_t>& out,const void* data,size_t size){const uint8_t* p=(const uint8_t*)data;out.insert(out.end(),p,p+size);return true;}
 void put16(uint8_t* out,uint16_t x){out[0]=(uint8_t)x;out[1]=(uint8_t)(x>>8);}
 void put32(uint8_t* out,uint32_t x){out[0]=(uint8_t)x;out[1]=(uint8_t)(x>>8);out[2]=(uint8_t)(x>>16);out[3]=(uint8_t)(x>>24);}
 void initWave(uint8_t h[44],unsigned channels){std::memset(h,0,44);std::memcpy(h,"RIFF",4);std::memcpy(h+8,"WAVEfmt ",8);put32(h+16,16);put16(h+20,1);put16(h+22,(uint16_t)channels);put32(h+24,48000);put32(h+28,48000*channels*2);put16(h+32,(uint16_t)(channels*2));put16(h+34,16);std::memcpy(h+36,"data",4);}
-bool readBlock(const std::vector<uint8_t>& b,size_t begin,size_t end,uint64_t wantedTrack,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,HANDLE wav,uint64_t& dataBytes,std::string& error){
+bool readBlock(const std::vector<uint8_t>& b,size_t begin,size_t end,uint64_t wantedTrack,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,std::vector<uint8_t>& wav,uint64_t& dataBytes,std::string& error){
     size_t p=begin;uint64_t track=0;unsigned trackLen=0;if(!vint(b,p,track,trackLen,false)||p+3>end)return false;
     p+=2;const uint8_t flags=b[p++];if(track!=wantedTrack)return true;
     const unsigned lace=(flags>>1)&3;std::vector<size_t> lengths;size_t payload=p;
@@ -56,7 +60,7 @@ bool readBlock(const std::vector<uint8_t>& b,size_t begin,size_t end,uint64_t wa
     std::vector<opus_int16> pcm(5760*channels);
     for(size_t packetSize:lengths){if(packetSize>end-p)return false;int frames=opus_decode(decoder,&b[p],(opus_int32)packetSize,pcm.data(),5760,0);if(frames<0){error=opus_strerror(frames);return false;}p+=packetSize;
         const unsigned skip=std::min<unsigned>(preSkip,(unsigned)frames);preSkip-=skip;const unsigned remain=(unsigned)frames-skip;if(!remain)continue;
-        const opus_int16* output=pcm.data()+(size_t)skip*channels;const DWORD bytes=remain*channels*sizeof(opus_int16);if(dataBytes+bytes>0xffffffffULL-36){error="PCM output is larger than the RIFF/WAVE limit.";return false;}if(!writeAll(wav,output,bytes))return false;dataBytes+=bytes;
+        const opus_int16* output=pcm.data()+(size_t)skip*channels;const size_t bytes=(size_t)remain*channels*sizeof(opus_int16);if(dataBytes+bytes>kMaxPcmBytes){error="Decoded PCM exceeds the in-memory limit.";return false;}if(!appendBytes(wav,output,bytes))return false;dataBytes+=bytes;
     }
     return p<=end;
 }
@@ -72,31 +76,41 @@ bool download(const std::string& url,std::vector<uint8_t>& data,std::string& err
     }else error="WebM audio request failed: "+std::to_string(GetLastError());
     if(req)WinHttpCloseHandle(req);if(conn)WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return ok;
 }
-std::wstring newWavePath(){wchar_t directory[MAX_PATH]{},file[MAX_PATH]{};if(!GetTempPathW(MAX_PATH,directory)||!GetTempFileNameW(directory,L"ytm",0,file))return {};DeleteFileW(file);std::wstring p=file;size_t dot=p.rfind(L'.');if(dot!=std::wstring::npos)p.resize(dot);p+=L".wav";return p;}
-bool decodeBlockGroup(const std::vector<uint8_t>& b,const Element& group,uint64_t track,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,HANDLE wav,uint64_t& bytes,std::string& error){
+bool decodeBlockGroup(const std::vector<uint8_t>& b,const Element& group,uint64_t track,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,std::vector<uint8_t>& wav,uint64_t& bytes,std::string& error){
     for(size_t p=group.data;p<group.end;){Element e{};if(!element(b,p,group.end,e))return false;p=e.end;if(e.id==0xA1&&!readBlock(b,e.data,e.end,track,decoder,channels,preSkip,wav,bytes,error))return false;}return true;
 }
 }
 
-bool decodeWebmOpusToWav(const std::string& url,std::wstring& wavPath,std::string& diagnostic){
-    std::vector<uint8_t> bytes;if(!download(url,bytes,diagnostic))return false;
-    Element segment{};size_t p=0;while(p<bytes.size()){Element e{};if(!element(bytes,p,bytes.size(),e)){diagnostic="Invalid EBML/WebM element tree.";return false;}p=e.end;if(e.id==0x18538067){segment=e;break;}}
-    if(!segment.id){diagnostic="WebM Segment element is missing.";return false;}
-    OpusTrack track{};size_t cursor=segment.data;
-    for(size_t q=cursor;q<segment.end;){Element e{};if(!element(bytes,q,segment.end,e)){diagnostic="Malformed WebM Segment.";return false;}q=e.end;if(e.id==0x1654AE6B){for(size_t r=e.data;r<e.end;){Element child{};if(!element(bytes,r,e.end,child)){diagnostic="Malformed WebM Tracks.";return false;}r=child.end;if(child.id==0xAE&&!parseTrack(bytes,child,track)){diagnostic="Malformed WebM audio track.";return false;}}}}
-    if(!track.found){diagnostic="WebM has no supported mono/stereo A_OPUS track.";return false;}
-    int opusError=OPUS_OK;OpusDecoder* decoder=opus_decoder_create(48000,(int)track.channels,&opusError);if(!decoder){diagnostic="Opus decoder creation failed: "+std::string(opus_strerror(opusError));return false;}
-    wavPath=newWavePath();HANDLE output=wavPath.empty()?INVALID_HANDLE_VALUE:CreateFileW(wavPath.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_TEMPORARY,nullptr);
-    if(output==INVALID_HANDLE_VALUE){diagnostic="Could not create temporary WAV.";opus_decoder_destroy(decoder);return false;}
-    uint8_t header[44]{};initWave(header,track.channels);bool ok=writeAll(output,header,sizeof(header));uint64_t dataBytes=0;unsigned preSkip=track.preSkip;cursor=segment.data;
-    for(size_t q=cursor;ok&&q<segment.end;){Element e{};if(!element(bytes,q,segment.end,e)){diagnostic="Malformed WebM Segment while reading audio.";ok=false;break;}q=e.end;if(e.id!=0x1F43B675)continue;
-        for(size_t r=e.data;ok&&r<e.end;){Element child{};if(!element(bytes,r,e.end,child)){diagnostic="Malformed WebM Cluster.";ok=false;break;}r=child.end;
-            if(child.id==0xA3)ok=readBlock(bytes,child.data,child.end,track.number,decoder,track.channels,preSkip,output,dataBytes,diagnostic);
-            else if(child.id==0xA0)ok=decodeBlockGroup(bytes,child,track.number,decoder,track.channels,preSkip,output,dataBytes,diagnostic);
+bool decodeWebmOpusToWav(const std::string& url,std::vector<uint8_t>& wav,std::string& diagnostic){
+    wav.clear();
+    try{
+        std::vector<uint8_t> bytes;if(!download(url,bytes,diagnostic))return false;
+        Element segment{};size_t p=0;while(p<bytes.size()){Element e{};if(!element(bytes,p,bytes.size(),e)){diagnostic="Invalid EBML/WebM element tree.";return false;}p=e.end;if(e.id==0x18538067){segment=e;break;}}
+        if(!segment.id){diagnostic="WebM Segment element is missing.";return false;}
+        OpusTrack track{};uint64_t timecodeScale=1000000;double duration=0;
+        for(size_t q=segment.data;q<segment.end;){Element e{};if(!element(bytes,q,segment.end,e)){diagnostic="Malformed WebM Segment.";return false;}q=e.end;
+            if(e.id==0x1654AE6B){for(size_t r=e.data;r<e.end;){Element child{};if(!element(bytes,r,e.end,child)){diagnostic="Malformed WebM Tracks.";return false;}r=child.end;if(child.id==0xAE&&!parseTrack(bytes,child,track)){diagnostic="Malformed WebM audio track.";return false;}}}
+            else if(e.id==0x1549A966){for(size_t r=e.data;r<e.end;){Element child{};if(!element(bytes,r,e.end,child))break;r=child.end;if(child.id==0x2AD7B1&&child.size)timecodeScale=uintElement(bytes,child);else if(child.id==0x4489)duration=floatElement(bytes,child);}}}
+        if(!track.found){diagnostic="WebM has no supported mono/stereo A_OPUS track.";return false;}
+        int opusError=OPUS_OK;std::unique_ptr<OpusDecoder,void(*)(OpusDecoder*)> decoder(opus_decoder_create(48000,(int)track.channels,&opusError),opus_decoder_destroy);
+        if(!decoder){diagnostic="Opus decoder creation failed: "+std::string(opus_strerror(opusError));return false;}
+        // Reserva el buffer final de una vez usando la duración del contenedor (o una estimación por tamaño) para evitar copias por crecimiento.
+        const double seconds=duration*(double)timecodeScale/1e9;const uint64_t bytesPerSecond=48000ull*track.channels*2;
+        uint64_t estimate=(seconds>0&&seconds<86400)?(uint64_t)(seconds*(double)bytesPerSecond):(uint64_t)bytes.size()*12ull;
+        estimate=std::min<uint64_t>(estimate+bytesPerSecond,kMaxPcmBytes);wav.reserve((size_t)estimate+44);
+        uint8_t header[44]{};initWave(header,track.channels);appendBytes(wav,header,sizeof(header));
+        bool ok=true;uint64_t dataBytes=0;unsigned preSkip=track.preSkip;
+        for(size_t q=segment.data;ok&&q<segment.end;){Element e{};if(!element(bytes,q,segment.end,e)){diagnostic="Malformed WebM Segment while reading audio.";ok=false;break;}q=e.end;if(e.id!=0x1F43B675)continue;
+            for(size_t r=e.data;ok&&r<e.end;){Element child{};if(!element(bytes,r,e.end,child)){diagnostic="Malformed WebM Cluster.";ok=false;break;}r=child.end;
+                if(child.id==0xA3)ok=readBlock(bytes,child.data,child.end,track.number,decoder.get(),track.channels,preSkip,wav,dataBytes,diagnostic);
+                else if(child.id==0xA0)ok=decodeBlockGroup(bytes,child,track.number,decoder.get(),track.channels,preSkip,wav,dataBytes,diagnostic);
+            }
         }
+        if(!ok||!dataBytes){if(diagnostic.empty())diagnostic="WebM contained no decodable Opus packets.";wav.clear();wav.shrink_to_fit();return false;}
+        put32(wav.data()+4,(uint32_t)(36+dataBytes));put32(wav.data()+40,(uint32_t)dataBytes);
+        diagnostic="Decoded "+std::to_string(dataBytes)+" PCM bytes with libopus into memory.";return true;
+    }catch(const std::bad_alloc&){
+        diagnostic="Out of memory while decoding Opus audio.";std::vector<uint8_t>().swap(wav);return false;
     }
-    if(ok&&dataBytes){put32(header+4,(uint32_t)(36+dataBytes));put32(header+40,(uint32_t)dataBytes);DWORD written=0;LARGE_INTEGER zero{};if(!SetFilePointerEx(output,zero,nullptr,FILE_BEGIN)||!WriteFile(output,header,sizeof(header),&written,nullptr)||written!=sizeof(header))ok=false;}
-    CloseHandle(output);opus_decoder_destroy(decoder);if(!ok||!dataBytes){if(diagnostic.empty())diagnostic="WebM contained no decodable Opus packets.";DeleteFileW(wavPath.c_str());wavPath.clear();return false;}
-    diagnostic="Decoded "+std::to_string(dataBytes)+" PCM bytes with libopus.";return true;
 }
 }
