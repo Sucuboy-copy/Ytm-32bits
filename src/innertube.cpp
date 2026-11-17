@@ -5,6 +5,7 @@
 #include "ytm/innertube.hpp"
 #include "ytm/json.hpp"
 #include "ytm/session.hpp"
+#include "ytm/oauth.hpp"
 namespace ytm {
 namespace {
 struct ClientProfile { const wchar_t* name; const wchar_t* version; const wchar_t* agent; const wchar_t* numericId; };
@@ -82,7 +83,7 @@ std::string fetchVisitorData(std::string& log){
     if(value&&value->kind==JsonValue::Kind::Scalar){log+="VisitorData extracted from YouTube bootstrap.\r\n";return value->scalar;}
     log+="VisitorData field missing from bootstrap.\r\n";return {};
 }
-std::string requestPlayer(const ClientProfile& client,const std::string& videoId,const std::string& visitorData,std::string& log,DWORD& httpStatus){
+std::string requestPlayer(const ClientProfile& client,const std::string& videoId,const std::string& visitorData,const std::wstring& bearer,std::string& log,DWORD& httpStatus){
     HINTERNET session=WinHttpOpen(client.agent,WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
     if(!session){log+="WinHttpOpen failed: "+std::to_string(GetLastError())+"\r\n";return {};}
     WinHttpSetTimeouts(session,5000,5000,9000,9000);
@@ -98,7 +99,11 @@ std::string requestPlayer(const ClientProfile& client,const std::string& videoId
     HINTERNET req=conn?WinHttpOpenRequest(conn,L"POST",L"/youtubei/v1/player?key=AIzaSyAO_F4S2JSlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",nullptr,L"https://m.youtube.com/",WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE):nullptr;
     std::string response;
     if(req){
-        std::wstring headers=L"Content-Type: application/json; charset=utf-8\r\nX-YouTube-Client-Name: ";headers+=client.numericId;headers+=L"\r\nX-YouTube-Client-Version: ";headers+=client.version;headers+=L"\r\nUser-Agent: ";headers+=client.agent;headers+=L"\r\n";headers+=L"Origin: https://m.youtube.com\r\nReferer: https://m.youtube.com/\r\n";const std::wstring auth=authenticatedHeaders(L"https://m.youtube.com");headers+=auth;log+=auth.empty()?"Session headers: none\r\n":"Session headers: attached (redacted)\r\n";
+        std::wstring headers=L"Content-Type: application/json; charset=utf-8\r\nX-YouTube-Client-Name: ";headers+=client.numericId;headers+=L"\r\nX-YouTube-Client-Version: ";headers+=client.version;headers+=L"\r\nUser-Agent: ";headers+=client.agent;headers+=L"\r\n";headers+=L"Origin: https://m.youtube.com\r\nReferer: https://m.youtube.com/\r\n";
+        std::wstring auth;
+        if(clientName==L"ANDROID_VR"&&!bearer.empty()){auth=L"Authorization: Bearer "+bearer+L"\r\n";log+="Android VR OAuth Bearer: attached (redacted)\r\n";}
+        else{auth=authenticatedHeaders(L"https://m.youtube.com");log+=auth.empty()?"Session headers: none\r\n":"Session headers: attached (redacted)\r\n";}
+        headers+=auth;
         BOOL sent=WinHttpSendRequest(req,headers.c_str(),(DWORD)-1,(LPVOID)body.data(),(DWORD)body.size(),(DWORD)body.size(),0);
         BOOL received=sent&&WinHttpReceiveResponse(req,nullptr);if(!sent)log+="WinHttpSendRequest error: "+std::to_string(GetLastError())+"\r\n";else if(!received)log+="WinHttpReceiveResponse error: "+std::to_string(GetLastError())+"\r\n";
         DWORD size=sizeof(httpStatus);if(received&&!WinHttpQueryHeaders(req,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&httpStatus,&size,WINHTTP_NO_HEADER_INDEX))log+="Status query error: "+std::to_string(GetLastError())+"\r\n";
@@ -111,8 +116,11 @@ std::vector<AudioFormat> resolveAudio(const std::string& videoId,std::string vis
     std::vector<AudioFormat> all;
     loginRequired=false;
     if(visitorData.empty())visitorData=fetchVisitorData(log);
+    std::string oauthDiagnostic;const std::wstring bearer=oauthBearerToken(oauthDiagnostic);
+    if(!bearer.empty())log+="Android VR OAuth token ready.\r\n";else if(!oauthDiagnostic.empty())log+=oauthDiagnostic+"\r\n";
     for(const auto& client:CLIENTS){
-        log+="Player client: "+narrow(client.name)+" "+narrow(client.version)+"\r\n";DWORD status=0;std::string json=requestPlayer(client,videoId,visitorData,log,status);if(json.empty())continue;
+        if(std::wstring(client.name)==L"ANDROID_VR"&&bearer.empty()){log+="FourthTube auth flow uses ANDROID_VR only with OAuth; skipped without a Bearer token.\r\n";continue;}
+        log+="Player client: "+narrow(client.name)+" "+narrow(client.version)+"\r\n";DWORD status=0;std::string json=requestPlayer(client,videoId,visitorData,bearer,log,status);if(json.empty())continue;
         std::vector<AudioFormat> found=audioFormatsFromPlayerResponse(json,log,loginRequired);
         if(!found.empty()){for(const auto& f:found){log+="Direct audio format available: itag "+std::to_string(f.itag)+"\r\n";all.push_back(f);}continue;}
         log+="No direct URL for audio itag 251/140 in this response.\r\n";

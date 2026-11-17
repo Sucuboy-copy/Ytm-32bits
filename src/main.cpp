@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <shlwapi.h>
 #include <mfapi.h>
 #include <mfmediaengine.h>
 #include <string>
@@ -18,6 +19,8 @@
 #include "ytm/json.hpp"
 #include "ytm/innertube.hpp"
 #include "ytm/session.hpp"
+#include "ytm/oauth.hpp"
+#include "ytm/opus_decoder.hpp"
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -25,9 +28,13 @@ namespace {
 using namespace ytm;
 constexpr UINT WM_SEARCH_DONE = WM_APP + 1;
 constexpr UINT WM_PLAYBACK_READY = WM_APP + 2, WM_MEDIA_ENGINE_EVENT = WM_APP + 3;
+constexpr UINT WM_OAUTH_BEGIN_DONE = WM_APP + 4, WM_OAUTH_POLL_DONE = WM_APP + 5;
+constexpr UINT WM_OPUS_DECODE_DONE = WM_APP + 6;
 constexpr int ID_QUERY = 101, ID_SEARCH = 102, ID_RESULTS = 103, ID_STATUS = 104, ID_LOG = 105, ID_PLAY = 106, ID_PAUSE = 107, ID_LOGIN = 108;
 constexpr int ID_COOKIE = 201, ID_OPEN_BROWSER = 202, ID_SAVE_SESSION = 203, ID_CLEAR_SESSION = 204, ID_CANCEL_SESSION = 205, ID_IMPORT_COOKIES = 206;
+constexpr int ID_OAUTH_BEGIN = 207, ID_OAUTH_VERIFY = 208;
 HWND g_window, g_query, g_results, g_status, g_search, g_logButton, g_loginButton, g_logWindow, g_logEdit, g_authWindow, g_cookieEdit, g_playButton, g_pauseButton;
+HWND g_oauthCode, g_authStatus;
 HFONT g_font, g_heading;
 COLORREF const BG = RGB(17, 19, 25), PANEL = RGB(25, 28, 36), TEXT = RGB(238, 240, 245), MUTED = RGB(155, 163, 178), ACCENT = RGB(255, 75, 93);
 std::wstring g_lastLog;
@@ -39,6 +46,11 @@ std::vector<YouTubeVideoResult> g_searchResults;
 std::vector<AudioFormat> g_activeFormats;
 size_t g_activeFormat = 0;
 DWORD g_playRequestToken = 0;
+LONG g_oauthPollBusy = 0;
+std::wstring g_oauthVerificationUrl;
+struct OAuthPayload { ytm::OAuthDeviceInfo info; };
+struct OpusDecodePayload { DWORD requestToken = 0; size_t formatIndex = 0; bool success = false; std::wstring wavPath; std::string diagnostic; };
+std::vector<std::wstring> g_opusWavePaths;
 bool g_mfStarted = false, g_comInitialized = false;
 IMFMediaEngine* g_mediaEngine = nullptr;
 class MediaEngineCallback;
@@ -100,6 +112,11 @@ bool initializeMediaPlayer(){
 void loadFormat(size_t index){
     if(!g_mediaEngine||index>=g_activeFormats.size())return;
     g_activeFormat=index;
+    if(g_activeFormats[index].itag==251){
+        const DWORD requestToken=g_playRequestToken;const std::string url=g_activeFormats[index].url;
+        SetWindowText(g_status,L"Decodificando WebM/Opus…");addLog(L"Descargando y decodificando itag 251 con libopus.");
+        std::thread([requestToken,index,url]{auto* p=new OpusDecodePayload();p->requestToken=requestToken;p->formatIndex=index;p->success=decodeWebmOpusToWav(url,p->wavPath,p->diagnostic);if(!PostMessage(g_window,WM_OPUS_DECODE_DONE,0,(LPARAM)p)){if(!p->wavPath.empty())DeleteFileW(p->wavPath.c_str());delete p;}}).detach();return;
+    }
     std::wstring url=utf8(g_activeFormats[index].url);
     BSTR source=SysAllocString(url.c_str());
     HRESULT hr=source?g_mediaEngine->SetSource(source):E_OUTOFMEMORY;
@@ -140,54 +157,59 @@ LRESULT CALLBACK logProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProc(h,m,w,l);
 }
 void closeAuthWindow() {
-    if(g_authWindow){DestroyWindow(g_authWindow);g_authWindow=nullptr;g_cookieEdit=nullptr;EnableWindow(g_window,TRUE);SetForegroundWindow(g_window);}
+    if(g_authWindow){KillTimer(g_authWindow,1);DestroyWindow(g_authWindow);g_authWindow=nullptr;g_cookieEdit=nullptr;g_oauthCode=nullptr;g_authStatus=nullptr;EnableWindow(g_window,TRUE);SetForegroundWindow(g_window);}
 }
 LRESULT CALLBACK authProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch(m){
     case WM_CREATE:{
-        CreateWindowEx(0,L"STATIC",L"1. Abre YouTube e inicia sesión en el navegador externo.\r\n2. Exporta las cookies del navegador como cookies.txt (formato Netscape) e impórtalas abajo.\r\nLa app filtra YouTube, cifra la sesión y nunca solicita tu contraseña.",WS_CHILD|WS_VISIBLE,20,18,520,82,h,nullptr,nullptr,nullptr);
-        g_cookieEdit=CreateWindowEx(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_PASSWORD|ES_AUTOHSCROLL,20,108,520,30,h,(HMENU)ID_COOKIE,nullptr,nullptr);SendMessage(g_cookieEdit,EM_LIMITTEXT,32000,0);
-        CreateWindowEx(0,L"BUTTON",L"Abrir YouTube",WS_CHILD|WS_VISIBLE|WS_TABSTOP,20,158,110,32,h,(HMENU)ID_OPEN_BROWSER,nullptr,nullptr);
-        CreateWindowEx(0,L"BUTTON",L"Importar cookies.txt",WS_CHILD|WS_VISIBLE|WS_TABSTOP,135,158,125,32,h,(HMENU)ID_IMPORT_COOKIES,nullptr,nullptr);
-        CreateWindowEx(0,L"BUTTON",L"Guardar",WS_CHILD|WS_VISIBLE|WS_TABSTOP,265,158,90,32,h,(HMENU)ID_SAVE_SESSION,nullptr,nullptr);
-        CreateWindowEx(0,L"BUTTON",L"Borrar",WS_CHILD|WS_VISIBLE|WS_TABSTOP,360,158,75,32,h,(HMENU)ID_CLEAR_SESSION,nullptr,nullptr);
-        CreateWindowEx(0,L"BUTTON",L"Cerrar",WS_CHILD|WS_VISIBLE|WS_TABSTOP,440,158,100,32,h,(HMENU)ID_CANCEL_SESSION,nullptr,nullptr);
+        CreateWindowEx(0,L"STATIC",L"Android VR usa OAuth de dispositivo, igual que FourthTube. Pulsa Iniciar, abre la página de verificación e introduce el código. El token de renovación se cifra con DPAPI.",WS_CHILD|WS_VISIBLE,20,18,540,58,h,nullptr,nullptr,nullptr);
+        g_oauthCode=CreateWindowEx(WS_EX_CLIENTEDGE,L"EDIT",L"Pulsa Iniciar Android VR para obtener un código",WS_CHILD|WS_VISIBLE|ES_READONLY|ES_CENTER,20,84,540,34,h,nullptr,nullptr,nullptr);
+        g_authStatus=CreateWindowEx(0,L"STATIC",L"Sin sesión Android VR",WS_CHILD|WS_VISIBLE,20,126,540,28,h,nullptr,nullptr,nullptr);
+        CreateWindowEx(0,L"BUTTON",L"Iniciar Android VR",WS_CHILD|WS_VISIBLE|WS_TABSTOP,20,170,145,34,h,(HMENU)ID_OAUTH_BEGIN,nullptr,nullptr);
+        HWND verify=CreateWindowEx(0,L"BUTTON",L"Abrir verificación",WS_CHILD|WS_VISIBLE|WS_TABSTOP,175,170,145,34,h,(HMENU)ID_OAUTH_VERIFY,nullptr,nullptr);EnableWindow(verify,FALSE);
+        CreateWindowEx(0,L"BUTTON",L"Borrar sesión",WS_CHILD|WS_VISIBLE|WS_TABSTOP,330,170,105,34,h,(HMENU)ID_CLEAR_SESSION,nullptr,nullptr);
+        CreateWindowEx(0,L"BUTTON",L"Cerrar",WS_CHILD|WS_VISIBLE|WS_TABSTOP,445,170,115,34,h,(HMENU)ID_CANCEL_SESSION,nullptr,nullptr);
         for(HWND child=GetWindow(h,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))SendMessage(child,WM_SETFONT,(WPARAM)g_font,TRUE);
-        {const std::wstring cookie=ytm::sessionCookie();if(!cookie.empty())SetWindowText(g_cookieEdit,cookie.c_str());}
+        if(ytm::hasOAuthSession()){SetWindowText(g_authStatus,L"Sesión Android VR guardada; se renovará cuando haga falta.");SetWindowText(g_oauthCode,L"Android VR autorizado");}
         return 0;}
     case WM_COMMAND:
-        if(LOWORD(w)==ID_OPEN_BROWSER){ShellExecuteW(h,L"open",L"https://music.youtube.com",nullptr,nullptr,SW_SHOWNORMAL);addLog(L"Abriendo YouTube en el navegador externo.");return 0;}
-        if(LOWORD(w)==ID_IMPORT_COOKIES){
-            wchar_t path[MAX_PATH]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=h;dialog.lpstrFilter=L"Cookies Netscape (*.txt)\0*.txt;cookies\0Todos los archivos (*.*)\0*.*\0\0";dialog.lpstrFile=path;dialog.nMaxFile=MAX_PATH;dialog.lpstrTitle=L"Importar cookies.txt de YouTube";dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
-            if(GetOpenFileNameW(&dialog)){std::wstring cookie;size_t count=0;if(!importNetscapeCookies(path,cookie,count)){MessageBoxW(h,L"No se encontraron cookies válidas de youtube.com en ese archivo.",L"Importación fallida",MB_ICONWARNING);return 0;}if(cookieValue(cookie,L"SAPISID").empty()&&cookieValue(cookie,L"__Secure-3PAPISID").empty()){SecureZeroMemory(&cookie[0],cookie.size()*sizeof(wchar_t));MessageBoxW(h,L"El archivo no contiene SAPISID ni __Secure-3PAPISID. Exporta también las cookies de autenticación de YouTube.",L"Falta cookie de sesión",MB_ICONWARNING);return 0;}SetWindowTextW(g_cookieEdit,cookie.c_str());addLog(L"Importadas "+std::to_wstring(count)+L" cookies de YouTube desde archivo Netscape.");SetWindowText(g_status,L"Cookies cargadas · pulsa Guardar para cifrar la sesión.");SecureZeroMemory(&cookie[0],cookie.size()*sizeof(wchar_t));}
-            return 0;
+        if(LOWORD(w)==ID_OAUTH_BEGIN){
+            EnableWindow(GetDlgItem(h,ID_OAUTH_BEGIN),FALSE);SetWindowText(g_authStatus,L"Solicitando código a YouTube…");
+            std::thread([h]{auto* result=new OAuthPayload{ytm::beginOAuthDeviceFlow()};if(!PostMessage(h,WM_OAUTH_BEGIN_DONE,0,(LPARAM)result))delete result;}).detach();return 0;
         }
-        if(LOWORD(w)==ID_SAVE_SESSION){
-            int length=GetWindowTextLengthW(g_cookieEdit);if(length<=0){MessageBoxW(h,L"Pega primero el encabezado Cookie de YouTube.",L"Sesión de YouTube",MB_ICONINFORMATION);return 0;}
-            std::wstring cookie((size_t)length+1,L'\0');GetWindowTextW(g_cookieEdit,&cookie[0],length+1);cookie.resize(length);
-            while(!cookie.empty()&&(cookie[0]==L' '||cookie[0]==L'\t'))cookie.erase(cookie.begin());
-            if(cookie.size()>=7&&_wcsnicmp(cookie.c_str(),L"Cookie:",7)==0)cookie.erase(0,7);
-            if(cookie.find_first_of(L"\r\n")!=std::wstring::npos||(cookieValue(cookie,L"SAPISID").empty()&&cookieValue(cookie,L"__Secure-3PAPISID").empty())){
-                SecureZeroMemory(&cookie[0],cookie.size()*sizeof(wchar_t));MessageBoxW(h,L"No encuentro SAPISID o __Secure-3PAPISID. Exporta las cookies de sesión de YouTube.",L"Cookie incompleta",MB_ICONWARNING);return 0;
-            }
-            if(!saveSession(cookie)){SecureZeroMemory(&cookie[0],cookie.size()*sizeof(wchar_t));MessageBoxW(h,L"Windows no pudo cifrar o guardar la sesión.",L"Error al guardar",MB_ICONERROR);return 0;}
-            ytm::setSessionCookie(cookie);
-            SecureZeroMemory(&cookie[0],cookie.size()*sizeof(wchar_t));
-            SetWindowText(g_loginButton,L"Sesión lista");SetWindowText(g_status,L"Sesión guardada cifrada en este usuario de Windows.");addLog(L"Sesión de YouTube guardada cifrada con DPAPI.");closeAuthWindow();return 0;
+        if(LOWORD(w)==ID_OAUTH_VERIFY){
+            if(!g_oauthVerificationUrl.empty())ShellExecuteW(h,L"open",g_oauthVerificationUrl.c_str(),nullptr,nullptr,SW_SHOWNORMAL);return 0;
         }
         if(LOWORD(w)==ID_CLEAR_SESSION){
-            ytm::clearSessionCookie();
-            {std::wstring path=sessionPath();if(!path.empty())DeleteFileW(path.c_str());}
-            SetWindowText(g_loginButton,L"Iniciar sesión");SetWindowText(g_status,L"Sesión eliminada.");addLog(L"Sesión guardada eliminada.");closeAuthWindow();return 0;
+            ytm::clearOAuthSession();ytm::clearSessionCookie();const std::wstring path=ytm::sessionPath();if(!path.empty())DeleteFileW(path.c_str());
+            KillTimer(h,1);SetWindowText(g_oauthCode,L"Sesión borrada");SetWindowText(g_authStatus,L"Sin sesión Android VR");SetWindowText(g_loginButton,L"Iniciar sesión");SetWindowText(g_status,L"Sesión eliminada.");addLog(L"Sesión OAuth Android VR y cookies locales borradas.");return 0;
         }
         if(LOWORD(w)==ID_CANCEL_SESSION){closeAuthWindow();return 0;}
         break;
+    case WM_TIMER:
+        if(w==1&&InterlockedCompareExchange(&g_oauthPollBusy,1,0)==0){
+            std::thread([h]{auto* result=new OAuthPayload{ytm::pollOAuthDeviceFlow()};if(!PostMessage(h,WM_OAUTH_POLL_DONE,0,(LPARAM)result))delete result;}).detach();
+        }return 0;
+    case WM_OAUTH_BEGIN_DONE:{
+        std::unique_ptr<OAuthPayload> result((OAuthPayload*)l);EnableWindow(GetDlgItem(h,ID_OAUTH_BEGIN),TRUE);
+        if(result->info.state<0){SetWindowText(g_authStatus,utf8(result->info.message).c_str());addLog(L"OAuth Android VR: "+utf8(result->info.message));return 0;}
+        g_oauthVerificationUrl=utf8(result->info.verificationUrl);SetWindowText(g_oauthCode,utf8(result->info.userCode).c_str());SetWindowText(g_authStatus,L"Abre la verificación y escribe el código. Esperando autorización…");EnableWindow(GetDlgItem(h,ID_OAUTH_VERIFY),TRUE);
+        SetTimer(h,1,(UINT)std::max(2,result->info.pollSeconds)*1000,nullptr);addLog(L"Código de autorización Android VR recibido; el código no se copia al log.");return 0;
+    }
+    case WM_OAUTH_POLL_DONE:{
+        InterlockedExchange(&g_oauthPollBusy,0);std::unique_ptr<OAuthPayload> result((OAuthPayload*)l);
+        if(result->info.state==0){SetTimer(h,1,(UINT)std::max(2,result->info.pollSeconds)*1000,nullptr);return 0;}
+        KillTimer(h,1);
+        if(result->info.state==1){SetWindowText(g_authStatus,L"Android VR autorizado. Reproducción usará Bearer OAuth.");SetWindowText(g_loginButton,L"Android VR listo");SetWindowText(g_status,L"Sesión Android VR lista para reproducir.");addLog(L"Autorización Android VR completada; refresh token cifrado con DPAPI.");}
+        else{SetWindowText(g_authStatus,utf8(result->info.message).c_str());addLog(L"OAuth Android VR: "+utf8(result->info.message));}
+        return 0;
+    }
     case WM_CLOSE:closeAuthWindow();return 0;
     }
     return DefWindowProc(h,m,w,l);
 }
 void showAuth() {
-    if(!g_authWindow){g_authWindow=CreateWindowEx(WS_EX_DLGMODALFRAME,L"Ytm32Auth",L"Iniciar sesión en YouTube Music",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,CW_USEDEFAULT,580,245,g_window,nullptr,(HINSTANCE)GetWindowLongPtr(g_window,GWLP_HINSTANCE),nullptr);if(!g_authWindow)return;EnableWindow(g_window,FALSE);}
+    if(!g_authWindow){g_authWindow=CreateWindowEx(WS_EX_DLGMODALFRAME,L"Ytm32Auth",L"Iniciar sesión en YouTube Music",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,CW_USEDEFAULT,600,265,g_window,nullptr,(HINSTANCE)GetWindowLongPtr(g_window,GWLP_HINSTANCE),nullptr);if(!g_authWindow)return;EnableWindow(g_window,FALSE);}
     ShowWindow(g_authWindow,SW_SHOW);SetForegroundWindow(g_authWindow);
 }
 void showLog() {
@@ -269,6 +291,16 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if(!initializeMediaPlayer()){SetWindowText(g_status,L"No se pudo iniciar el reproductor de Windows.");return 0;}
         EnableWindow(g_pauseButton,TRUE);SetWindowText(g_pauseButton,L"Pausa");loadFormat(0);return 0;
     }
+    case WM_OPUS_DECODE_DONE: {
+        std::unique_ptr<OpusDecodePayload> p(reinterpret_cast<OpusDecodePayload*>(l));
+        if(p->requestToken!=g_playRequestToken||p->formatIndex!=g_activeFormat){if(!p->wavPath.empty())DeleteFileW(p->wavPath.c_str());return 0;}
+        if(!p->success){addLog(L"No se pudo decodificar itag 251: "+utf8(p->diagnostic));if(g_activeFormat+1<g_activeFormats.size()){++g_activeFormat;addLog(L"Usando formato alternativo itag "+std::to_wstring(g_activeFormats[g_activeFormat].itag));loadFormat(g_activeFormat);}else SetWindowText(g_status,L"No se pudo decodificar el audio. Abre Registro.");return 0;}
+        wchar_t fileUrl[32768]{};DWORD capacity=(DWORD)(sizeof(fileUrl)/sizeof(fileUrl[0]));HRESULT hr=UrlCreateFromPathW(p->wavPath.c_str(),fileUrl,&capacity,0);
+        if(FAILED(hr)){DeleteFileW(p->wavPath.c_str());addLog(L"No se pudo convertir WAV a URL local. HRESULT: "+std::to_wstring((unsigned long)hr));SetWindowText(g_status,L"No se pudo abrir el audio convertido.");return 0;}
+        BSTR source=SysAllocString(fileUrl);hr=source?g_mediaEngine->SetSource(source):E_OUTOFMEMORY;if(source)SysFreeString(source);if(SUCCEEDED(hr))hr=g_mediaEngine->Play();
+        if(FAILED(hr)){DeleteFileW(p->wavPath.c_str());addLog(L"Media Engine no pudo abrir WAV. HRESULT: "+std::to_wstring((unsigned long)hr));SetWindowText(g_status,L"No se pudo abrir el audio convertido.");return 0;}
+        g_opusWavePaths.push_back(p->wavPath);addLog(L"Opus decodificado a WAV PCM temporal; reproduciendo itag 251.");SetWindowText(g_status,L"Cargando audio itag 251 (Opus)…");return 0;
+    }
     case WM_MEDIA_ENGINE_EVENT: {
         const DWORD event=(DWORD)w;
         std::unique_ptr<MediaEventPayload> eventInfo(reinterpret_cast<MediaEventPayload*>(l));
@@ -302,6 +334,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: { int width=LOWORD(l); MoveWindow(g_loginButton,width-152,29,120,30,TRUE); MoveWindow(g_query,32,112,width-180,36,TRUE); MoveWindow(g_search,width-140,112,108,36,TRUE); MoveWindow(g_results,32,180,width-64,HIWORD(l)-230,TRUE); MoveWindow(g_status,32,HIWORD(l)-38,width-392,24,TRUE); MoveWindow(g_playButton,width-360,HIWORD(l)-42,112,34,TRUE); MoveWindow(g_pauseButton,width-240,HIWORD(l)-42,92,34,TRUE); MoveWindow(g_logButton,width-140,HIWORD(l)-42,108,34,TRUE); return 0; }
     case WM_DESTROY:
         if(g_mediaEngine){g_mediaEngine->Shutdown();g_mediaEngine->Release();g_mediaEngine=nullptr;}
+        for(const auto& path:g_opusWavePaths)DeleteFileW(path.c_str());g_opusWavePaths.clear();
         if(g_mediaCallback){g_mediaCallback->Release();g_mediaCallback=nullptr;}
         if(g_mfStarted){MFShutdown();g_mfStarted=false;}
         if(g_comInitialized){CoUninitialize();g_comInitialized=false;}
@@ -311,6 +344,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
+    ytm::loadOAuthSession();
     loadSession();
     HRESULT comResult=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);if(SUCCEEDED(comResult))g_comInitialized=true;
     INITCOMMONCONTROLSEX ic{sizeof(ic),ICC_STANDARD_CLASSES}; InitCommonControlsEx(&ic);
@@ -318,7 +352,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     WNDCLASSEX authClass{sizeof(authClass)}; authClass.lpfnWndProc=authProc; authClass.hInstance=instance; authClass.hCursor=LoadCursor(nullptr,IDC_ARROW); authClass.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); authClass.lpszClassName=L"Ytm32Auth"; RegisterClassEx(&authClass);
     WNDCLASSEX wc{sizeof(wc)}; wc.lpfnWndProc=windowProc; wc.hInstance=instance; wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName=L"Ytm32Main"; RegisterClassEx(&wc);
     g_window=CreateWindowEx(0,wc.lpszClassName,L"Ytm32 — YouTube Music",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,650,590,nullptr,nullptr,instance,nullptr);
-    if(g_window&& ytm::hasSession())SetWindowText(g_loginButton,L"Sesión lista");
+    if(g_window&& ytm::hasOAuthSession())SetWindowText(g_loginButton,L"Android VR listo");
+    else if(g_window&& ytm::hasSession())SetWindowText(g_loginButton,L"Cookies listas");
     ShowWindow(g_window,show); UpdateWindow(g_window);
     MSG msg; while(GetMessage(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessage(&msg);} return (int)msg.wParam;
 }

@@ -22,13 +22,13 @@ cmake --build /tmp/ytm32-build --parallel
 
 ## Estado
 
-- Código separado por responsabilidad: `json.cpp` interpreta JSON, renderers de videos y formatos de `playerResponse`; `innertube.cpp` realiza las peticiones y el fallback de clientes; `session.cpp` importa y protege cookies; `main.cpp` contiene la UI Win32 y Media Engine.
+- Código separado por responsabilidad: `json.cpp` interpreta JSON, renderers de videos y formatos de `playerResponse`; `innertube.cpp` realiza las peticiones y el fallback de clientes; `oauth.cpp` gestiona OAuth de dispositivo; `opus_decoder.cpp` desempaqueta WebM y decodifica Opus; `main.cpp` contiene la UI Win32 y Media Engine.
 - Búsqueda asíncrona en `music.youtube.com/youtubei/v1/search` con `WEB_REMIX`; reconoce los renderers de música y los renderers de video de YouTube. Reutiliza el mismo `videoId` al consultar reproducción con los clientes de video.
 - Selección explícita de resultado y botones separados para reproducir y pausar/reanudar; doble clic también reproduce. El registro muestra actividad y errores con hora.
-- Al reproducir, prueba ANDROID_VR, ANDROID con perfil iOS anónimo, VISIONOS y TVHTML5; usa `visitorData` de la búsqueda o lo obtiene del bootstrap de YouTube. Si un cliente devuelve formatos sin URL directa (SABR), continúa con el siguiente. Prioriza URLs directas itag 251 y 140 y usa Media Engine de Windows 8+.
-- Inicio de sesión mediante navegador externo e importación de `cookies.txt` en formato Netscape. Las cookies se filtran por dominio YouTube, se protegen con DPAPI en el perfil actual de Windows y se genera SAPISIDHASH por petición; nunca se registra el secreto. La sesión puede caducar y requerir otra exportación.
-- La reproducción directa puede requerir una sesión de YouTube o GVS PO Token según la IP y el perfil. Windows 8.1 no trae decoder Opus en todas las instalaciones; si 251 falla, el reproductor prueba 140 y después los formatos del cliente fallback.
-- Ventana ligera, lista de resultados, entrada rápida con Enter y sin dependencias de terceros.
+- Al reproducir, busca con ANDROID_VR autenticado mediante Bearer OAuth y continúa con ANDROID, VISIONOS y TVHTML5 cuando hacen falta. Reutiliza el `videoId` de la búsqueda, y si un cliente devuelve formatos sin URL directa (SABR), continúa con el siguiente. Prioriza itag 251 y luego 140.
+- El login usa OAuth Device Flow de Android VR, como FourthTube: abre la verificación en el navegador, introduce el código y el programa conserva el refresh token cifrado con DPAPI. Las cookies Netscape antiguas permanecen como credencial opcional para las peticiones WEB_REMIX; los secretos no se escriben en el registro.
+- itag 251 se descarga en segundo plano, se desempaqueta desde WebM y se decodifica con libopus 1.6.1 incluida estáticamente; Media Engine recibe WAV PCM temporal y se elimina al cerrar la aplicación. Si el stream Opus falla, se intenta itag 140. La conversión requiere espacio temporal adicional proporcional a la duración.
+- Ventana nativa ligera, lista de resultados, entrada rápida con Enter y libopus estática para el formato Opus.
 - InnerTube cambia sin garantía de compatibilidad. Aún faltan cola, caché de URL y controles de reproducción avanzados.
 
 ## Referencia de interfaz
