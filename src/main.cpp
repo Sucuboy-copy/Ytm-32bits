@@ -434,7 +434,7 @@ void paint(HWND h) {
     }
     RECT player{176,r.bottom-94,r.right,r.bottom};HBRUSH pb=CreateSolidBrush(SURFACE);FillRect(dc,&player,pb);DeleteObject(pb);
     HPEN ppen=CreatePen(PS_SOLID,1,RGB(50,52,62));oldPen=SelectObject(dc,ppen);MoveToEx(dc,176,r.bottom-94,nullptr);LineTo(dc,r.right,r.bottom-94);SelectObject(dc,oldPen);DeleteObject(ppen);
-    const int progressY=r.bottom-84,progressLeft=278,progressRight=std::max(progressLeft+40,r.right-224);
+    const int progressY=r.bottom-84,progressLeft=278,progressRight=std::max(progressLeft+40,(int)r.right-224);
     RECT progressTrack{progressLeft,progressY,progressRight,progressY+3};HBRUSH tr=CreateSolidBrush(RGB(67,69,78));FillRect(dc,&progressTrack,tr);DeleteObject(tr);
     if(g_playbackDuration>0.0){double ratio=std::max(0.0,std::min(1.0,g_playbackPosition/g_playbackDuration));RECT filled=progressTrack;filled.right=progressLeft+(int)((progressRight-progressLeft)*ratio);HBRUSH fill=CreateSolidBrush(g_currentAccent);FillRect(dc,&filled,fill);DeleteObject(fill);}
     auto clockText=[](double value){int sec=std::isfinite(value)&&value>0?(int)value:0;wchar_t text[16]{};wsprintf(text,L"%d:%02d",sec/60,sec%60);return std::wstring(text);};
@@ -443,7 +443,7 @@ void paint(HWND h) {
     RECT art{196,r.bottom-67,246,r.bottom-17};auto currentArt=g_thumbnailBitmaps.find(g_currentVideoId);
     if(currentArt!=g_thumbnailBitmaps.end()){HDC mem=CreateCompatibleDC(dc);HGDIOBJ old=SelectObject(mem,currentArt->second);StretchBlt(dc,art.left,art.top,art.right-art.left,art.bottom-art.top,mem,0,0,96,96,SRCCOPY);SelectObject(mem,old);DeleteDC(mem);}
     else{HBRUSH ab=CreateSolidBrush(SOFT_ACCENT);FillRect(dc,&art,ab);DeleteObject(ab);SetTextColor(dc,g_currentAccent);RECT note=art;DrawText(dc,L"♪",-1,&note,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
-    const int metadataRight=std::max(340,176+(r.right-176)/2-120);
+    const int metadataRight=std::max(340,176+((int)r.right-176)/2-120);
     SetTextColor(dc,TEXT);RECT track{258,r.bottom-62,metadataRight,r.bottom-39};DrawText(dc,g_nowPlaying.empty()?L"Elige algo para reproducir":g_nowPlaying.c_str(),-1,&track,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
     SetTextColor(dc,MUTED);RECT artist{258,r.bottom-39,metadataRight,r.bottom-19};wchar_t statusText[256]{};GetWindowText(g_status,statusText,256);DrawText(dc,statusText[0]?statusText:L"YouTube Music · Reproductor ligero",-1,&artist,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
     EndPaint(h, &ps);
@@ -512,7 +512,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if(w==ID_TIMER_PLAYBACK&&g_mediaEngine){double position=g_mediaEngine->GetCurrentTime(),duration=g_mediaEngine->GetDuration();if(std::isfinite(position)&&position>=0)g_playbackPosition=position;if(std::isfinite(duration)&&duration>0)g_playbackDuration=duration;InvalidateRect(h,nullptr,FALSE);return 0;}break;
     case WM_LBUTTONDOWN: {
         const int x=LOWORD(l),y=HIWORD(l);
-        RECT client{};GetClientRect(h,&client);const int playerTop=client.bottom-94,left=278,right=std::max(left+40,client.right-224);
+        RECT client{};GetClientRect(h,&client);const int playerTop=client.bottom-94,left=278,right=std::max(left+40,(int)client.right-224);
         if(y>=playerTop&&y<=playerTop+18&&x>=left&&x<=right&&g_mediaEngine&&g_playbackDuration>0){double target=g_playbackDuration*(double)(x-left)/(double)(right-left);if(SUCCEEDED(g_mediaEngine->SetCurrentTime(target))){g_playbackPosition=target;InvalidateRect(h,nullptr,FALSE);}return 0;}break;
     }
     case WM_THUMBNAIL_READY: {
