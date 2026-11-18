@@ -2,9 +2,11 @@
 #include <winhttp.h>
 #include <opus.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <memory>
 #include <new>
@@ -98,7 +100,7 @@ bool fetchChunk(HINTERNET conn,const std::wstring& path,DWORD flags,std::vector<
 }
 // Descarga por bloques con el parámetro range de googlevideo (como yt-dlp): evita el límite de velocidad de las
 // descargas de archivo completo y permite detectar cortes. Cada bloque se reintenta una vez.
-bool download(const std::string& url,std::vector<uint8_t>& data,std::string& error){
+bool download(const std::string& url,std::vector<uint8_t>& data,std::string& error,const std::function<bool(bool)>& onChunk=nullptr,bool progressive=false){
     std::wstring wide(url.begin(),url.end());URL_COMPONENTS c{};c.dwStructSize=sizeof(c);wchar_t host[512]{},path[16384]{},extra[16384]{};c.lpszHostName=host;c.dwHostNameLength=512;c.lpszUrlPath=path;c.dwUrlPathLength=16384;c.lpszExtraInfo=extra;c.dwExtraInfoLength=16384;
     if(!WinHttpCrackUrl(wide.c_str(),(DWORD)wide.size(),0,&c)){error="Could not parse the signed audio URL.";return false;}
     const INTERNET_PORT port=c.nPort;const DWORD flags=c.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0;std::wstring requestPath(path,c.dwUrlPathLength);requestPath.append(extra,c.dwExtraInfoLength);
@@ -106,15 +108,19 @@ bool download(const std::string& url,std::vector<uint8_t>& data,std::string& err
     HINTERNET conn=WinHttpConnect(session,host,port,0);if(!conn){error="Opus download connection failed: "+std::to_string(GetLastError());WinHttpCloseHandle(session);return false;}
     const uint64_t total=contentLengthFromUrl(url);if(total>kMaxDownloadBytes){error="WebM audio exceeds the 80 MiB safety limit.";WinHttpCloseHandle(conn);WinHttpCloseHandle(session);return false;}
     if(total)data.reserve((size_t)total);
-    bool ok=true;uint64_t offset=0;
+    bool ok=true;uint64_t offset=0;size_t chunkIndex=0;
     while(ok){
-        uint64_t last=offset+kChunkBytes-1;if(total&&last>=total)last=total-1;
+        // En modo progresivo los primeros bloques son pequeños para que el audio empiece a sonar cuanto antes.
+        const uint64_t chunk=progressive?(chunkIndex==0?128ull*1024:chunkIndex==1?512ull*1024:kChunkBytes):kChunkBytes;++chunkIndex;
+        uint64_t last=offset+chunk-1;if(total&&last>=total)last=total-1;
         const std::wstring chunkPath=requestPath+L"&range="+std::to_wstring(offset)+L"-"+std::to_wstring(last);
         DWORD status=0;const size_t before=data.size();bool got=fetchChunk(conn,chunkPath,flags,data,status,error);
         if(!got&&status!=416&&!(status>=400&&status<500))got=fetchChunk(conn,chunkPath,flags,data,status,error);
         if(!got){if(status==416&&offset>0&&!total){error.clear();break;}ok=false;break;}
         const uint64_t received=data.size()-before;offset+=received;
-        if(total?offset>=total:received<kChunkBytes)break;
+        const bool complete=total?offset>=total:received<chunk;
+        if(onChunk&&!onChunk(complete)){ok=false;break;}
+        if(complete)break;
         if(!received){error="Audio server returned an empty chunk at byte "+std::to_string(offset)+".";ok=false;}
     }
     if(ok&&total&&offset!=total){error="WebM download incomplete: "+std::to_string(offset)+" of "+std::to_string(total)+" bytes.";ok=false;}
@@ -123,12 +129,84 @@ bool download(const std::string& url,std::vector<uint8_t>& data,std::string& err
 bool decodeBlockGroup(const std::vector<uint8_t>& b,const Element& group,uint64_t track,OpusDecoder* decoder,unsigned channels,unsigned& preSkip,std::vector<uint8_t>& wav,uint64_t& bytes,std::string& error){
     for(size_t p=group.data;p<group.end;){Element e{};if(!element(b,p,group.end,e))return false;p=e.end;if(e.id==0xA1&&!readBlock(b,e.data,e.end,track,decoder,channels,preSkip,wav,bytes,error))return false;}return true;
 }
+void parseInfo(const std::vector<uint8_t>& b,const Element& info,uint64_t& timecodeScale,double& duration){
+    for(size_t r=info.data;r<info.end;){Element c{};if(!element(b,r,info.end,c))break;r=c.end;
+        if(c.id==0x2AD7B1&&c.size)timecodeScale=uintElement(b,c);else if(c.id==0x4489)duration=floatElement(b,c);}
+}
+enum class Hdr { Ok, NeedMore, Bad };
+// Lee la cabecera de un elemento aunque su contenido aún no se haya descargado por completo.
+Hdr readHeader(const std::vector<uint8_t>& b,size_t pos,size_t parentEnd,Element& e){
+    size_t p=pos;uint64_t id=0,size=0;unsigned idLen=0,sizeLen=0;
+    if(!vint(b,p,id,idLen,true))return (pos<b.size()&&b[pos]==0)?Hdr::Bad:Hdr::NeedMore;
+    const size_t sizePos=p;
+    if(!vint(b,p,size,sizeLen,false))return (sizePos<b.size()&&b[sizePos]==0)?Hdr::Bad:Hdr::NeedMore;
+    if(idLen>4||id>0xffffffffULL)return Hdr::Bad;
+    bool unknown=true;for(unsigned n=0;n<sizeLen*7;++n)if(((size>>(sizeLen*7-1-n))&1)==0){unknown=false;break;}
+    if(p>parentEnd)return Hdr::Bad;
+    if(unknown)size=parentEnd-p;
+    if(size>parentEnd-p)return Hdr::Bad;
+    e={(uint32_t)id,p,(size_t)size,p+(size_t)size,unknown};return Hdr::Ok;
+}
+// Demultiplexor WebM incremental: step() avanza todo lo que permitan los bytes descargados hasta ahora
+// (b.size()) y decodifica a `pcm` los bloques completos. Los elementos Segment y Cluster se recorren por
+// dentro sin esperar a que lleguen enteros.
+struct OpusStream {
+    enum class Status { NeedMore, Done, Bulk, Error };
+    OpusStream(const std::vector<uint8_t>& bytes,uint64_t size):b(bytes),fileSize(size){}
+    const std::vector<uint8_t>& b;
+    uint64_t fileSize;
+    size_t pos=0,segmentEnd=0,clusterEnd=0;int level=0;
+    OpusTrack track{};uint64_t timecodeScale=1000000;double duration=0;bool started=false;
+    std::unique_ptr<OpusDecoder,void(*)(OpusDecoder*)> decoder{nullptr,opus_decoder_destroy};
+    unsigned preSkip=0;uint64_t dataBytes=0;
+    std::vector<uint8_t> pcm;
+    std::string error;
+    std::function<bool()> onStart;
+    double seconds() const{return duration*(double)timecodeScale/1e9;}
+    Status step(){
+        for(;;){
+            const size_t parentEnd=level==0?(size_t)fileSize:level==1?segmentEnd:clusterEnd;
+            if(pos>=parentEnd){if(level==2){level=1;continue;}return Status::Done;}
+            Element e{};const Hdr h=readHeader(b,pos,parentEnd,e);
+            if(h==Hdr::NeedMore)return Status::NeedMore;
+            if(h==Hdr::Bad){error="Invalid EBML/WebM element tree.";return Status::Error;}
+            if(level==0){if(e.id==0x18538067){segmentEnd=e.end;pos=e.data;level=1;}else pos=e.end;}
+            else if(level==1){
+                if(e.id==0x1654AE6B||e.id==0x1549A966){
+                    if(b.size()<e.end)return Status::NeedMore;
+                    if(e.id==0x1654AE6B){
+                        for(size_t r=e.data;r<e.end;){Element c{};if(!element(b,r,e.end,c)){error="Malformed WebM Tracks.";return Status::Error;}r=c.end;if(c.id==0xAE&&!parseTrack(b,c,track)){error="Malformed WebM audio track.";return Status::Error;}}
+                    }else parseInfo(b,e,timecodeScale,duration);
+                    pos=e.end;
+                }else if(e.id==0x1F43B675){
+                    if(!started){
+                        if(!track.found){error="WebM has no supported mono/stereo A_OPUS track.";return Status::Error;}
+                        const double s=seconds();if(!(s>0&&s<86400))return Status::Bulk;
+                        int opusError=OPUS_OK;decoder.reset(opus_decoder_create(48000,(int)track.channels,&opusError));
+                        if(!decoder){error="Opus decoder creation failed: "+std::string(opus_strerror(opusError));return Status::Error;}
+                        preSkip=track.preSkip;
+                        if(onStart&&!onStart())return Status::Error;
+                        started=true;
+                    }
+                    clusterEnd=e.end;pos=e.data;level=2;
+                }else pos=e.end;
+            }else{
+                if(e.id==0xA3||e.id==0xA0){
+                    if(b.size()<e.end)return Status::NeedMore;
+                    const bool ok=e.id==0xA3?readBlock(b,e.data,e.end,track.number,decoder.get(),track.channels,preSkip,pcm,dataBytes,error):decodeBlockGroup(b,e,track.number,decoder.get(),track.channels,preSkip,pcm,dataBytes,error);
+                    if(!ok){if(error.empty())error="Malformed WebM audio block.";return Status::Error;}
+                }
+                pos=e.end;
+            }
+        }
+    }
+};
 }
 
-bool decodeWebmOpusToWav(const std::string& url,std::vector<uint8_t>& wav,std::string& diagnostic){
+namespace {
+bool decodeBytes(const std::vector<uint8_t>& bytes,std::vector<uint8_t>& wav,std::string& diagnostic){
     wav.clear();
     try{
-        std::vector<uint8_t> bytes;if(!download(url,bytes,diagnostic))return false;
         Element segment{};size_t p=0;while(p<bytes.size()){Element e{};if(!element(bytes,p,bytes.size(),e)){diagnostic="Invalid EBML/WebM element tree.";return false;}p=e.end;if(e.id==0x18538067){segment=e;break;}}
         if(!segment.id){diagnostic="WebM Segment element is missing.";return false;}
         OpusTrack track{};uint64_t timecodeScale=1000000;double duration=0;
@@ -155,6 +233,64 @@ bool decodeWebmOpusToWav(const std::string& url,std::vector<uint8_t>& wav,std::s
         diagnostic="Decoded "+std::to_string(dataBytes)+" PCM bytes with libopus into memory.";return true;
     }catch(const std::bad_alloc&){
         diagnostic="Out of memory while decoding Opus audio.";std::vector<uint8_t>().swap(wav);return false;
+    }
+}
+}
+
+bool decodeWebmOpusToWav(const std::string& url,std::vector<uint8_t>& wav,std::string& diagnostic){
+    wav.clear();
+    try{
+        std::vector<uint8_t> bytes;if(!download(url,bytes,diagnostic))return false;
+        return decodeBytes(bytes,wav,diagnostic);
+    }catch(const std::bad_alloc&){
+        diagnostic="Out of memory while downloading Opus audio.";std::vector<uint8_t>().swap(wav);return false;
+    }
+}
+
+bool decodeWebmOpusStreaming(const std::string& url,const std::shared_ptr<PcmBuffer>& buffer,const std::function<void()>& onReady,std::string& diagnostic){
+    bool readySent=false;
+    auto signalReady=[&]{if(!readySent){readySent=true;if(onReady)onReady();}};
+    try{
+        const uint64_t total=contentLengthFromUrl(url);
+        if(!total||total>kMaxDownloadBytes){
+            // Sin tamaño conocido (clen) no se puede pedir por rangos ni estimar el WAV: descarga completa.
+            std::vector<uint8_t> wav;if(!decodeWebmOpusToWav(url,wav,diagnostic)){buffer->fail();return false;}
+            buffer->adopt(std::move(wav));signalReady();return true;
+        }
+        std::vector<uint8_t> bytes;OpusStream st(bytes,total);
+        st.onStart=[&]()->bool{
+            const uint64_t pcmBytes=(uint64_t)std::llround(st.seconds()*48000.0)*st.track.channels*2;
+            if(!pcmBytes||pcmBytes>kMaxPcmBytes){st.error="Decoded PCM exceeds the in-memory limit.";return false;}
+            if(!buffer->begin((size_t)(44+pcmBytes))){st.error=buffer->cancelled()?"Playback cancelled.":"Out of memory reserving the PCM buffer.";return false;}
+            uint8_t header[44]{};initWave(header,st.track.channels);put32(header+4,(uint32_t)(36+pcmBytes));put32(header+40,(uint32_t)pcmBytes);
+            buffer->append(header,sizeof(header));return true;
+        };
+        bool bulk=false,finished=false;std::string error;
+        const bool downloaded=download(url,bytes,error,[&](bool complete)->bool{
+            if(buffer->cancelled()){error="Playback cancelled.";return false;}
+            if(bulk)return true;
+            const OpusStream::Status status=st.step();
+            if(!st.pcm.empty()){buffer->append(st.pcm.data(),st.pcm.size());st.pcm.clear();}
+            if(status==OpusStream::Status::Error){error=st.error;return false;}
+            if(status==OpusStream::Status::Bulk){bulk=true;return true;}
+            if(status==OpusStream::Status::Done)finished=true;
+            else if(complete){error="WebM ended before all audio data (truncated stream).";return false;}
+            // Con ~2 s de PCM ya escritos Media Engine puede empezar; el resto se sigue decodificando.
+            if(st.started&&(finished||buffer->written()>=std::min<size_t>(buffer->total(),44+(size_t)2*48000*st.track.channels*2)))signalReady();
+            return true;
+        },true);
+        if(!downloaded){diagnostic=error;buffer->fail();return false;}
+        if(bulk){
+            // Contenedor sin duración: no se puede dimensionar el WAV por adelantado; se decodifica todo.
+            std::vector<uint8_t> wav;if(!decodeBytes(bytes,wav,diagnostic)){buffer->fail();return false;}
+            buffer->adopt(std::move(wav));signalReady();return true;
+        }
+        if(!finished){diagnostic="WebM parser did not reach the end of the stream.";buffer->fail();return false;}
+        const uint64_t expected=buffer->total()-44;
+        buffer->finish();signalReady();
+        diagnostic="Decoded "+std::to_string(st.dataBytes)+" of "+std::to_string(expected)+" PCM bytes with libopus (streaming).";return true;
+    }catch(const std::bad_alloc&){
+        diagnostic="Out of memory while streaming Opus audio.";buffer->fail();return false;
     }
 }
 }
